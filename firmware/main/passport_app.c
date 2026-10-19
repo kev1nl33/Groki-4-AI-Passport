@@ -185,10 +185,18 @@ static void show(const char *status, const char *hint)
     lv_label_set_text_fmt(s_volume_label,"Volume %u",(unsigned)s_volume);
     if (battery < 0) lv_label_set_text(s_battery, "--");
     else lv_label_set_text_fmt(s_battery, "%d%%", battery);
-    /* Setup reuses the face area for the password; hide the avatar then. */
+    /* Setup shows the hotspot password, which needs the tall detail area the
+       avatar normally occupies; swap the two rather than squeezing the text. */
     if (s_face_box) {
-        if (s_setup) lv_obj_add_flag(s_face_box, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_remove_flag(s_face_box, LV_OBJ_FLAG_HIDDEN);
+        if (s_setup) {
+            lv_obj_add_flag(s_face_box, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(s_details, 18, 111);
+            lv_obj_set_size(s_details, 204, 140);
+        } else {
+            lv_obj_remove_flag(s_face_box, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(s_details, 18, 226);
+            lv_obj_set_size(s_details, 204, 34);
+        }
     }
     bsp_lvgl_unlock();
 }
