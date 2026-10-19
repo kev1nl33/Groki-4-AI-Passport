@@ -505,6 +505,16 @@ int main(void){
         self.assertIn("esp_websocket_client_config_t", self.app)
         self.assertIn("cfg.uri = s_ws_uri", self.app)
 
+    def test_face_logic_stays_out_of_the_renderer(self) -> None:
+        # Stage F: animation decisions are pure logic; the app only maps them
+        # onto LVGL objects. The face module must not touch LVGL or audio.
+        face = read("main/passport_face.c") + read("main/passport_face.h")
+        self.assertNotIn("lvgl", face)
+        self.assertNotIn("bsp_", face)
+        self.assertIn('"passport_face.c"', self.cmake)
+        self.assertIn("pv_face_tick", self.app)
+        self.assertIn("s_mouth_level", function_body(self.app, "play_task"))
+
 
 if __name__ == "__main__":
     unittest.main()

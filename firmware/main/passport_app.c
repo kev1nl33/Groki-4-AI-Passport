@@ -3,6 +3,7 @@
 #include "passport_ws.h"
 #include "passport_audio.h"
 #include "passport_downlink.h"
+#include "passport_face.h"
 #include "bsp_display.h"
 #include "bsp_i2c.h"
 #include "bsp_battery.h"
@@ -110,6 +111,12 @@ static atomic_bool s_down_format_24k;      /* playback format is active */
 static atomic_bool s_down_stop_pending;    /* tts.stop: drain before Ready */
 static atomic_uint s_down_dropped;
 static bool s_down_error;                  /* owner-only UI flag */
+/* Stage F avatar: the play task publishes a peak level, the LVGL timer reads
+   it. One atomic, no lock on the audio path. */
+static atomic_uchar s_mouth_level;
+static pv_face_model_t s_face;
+static lv_timer_t *s_face_timer;
+static lv_obj_t *s_face_box, *s_eye_l, *s_eye_r, *s_pupil_l, *s_pupil_r, *s_mouth;
 static pv_model_t s_model;
 static pv_config_t s_saved, s_active;
 static bool s_nvs_ready, s_wifi_ready, s_wifi_started, s_sta_enabled;
@@ -132,6 +139,28 @@ static char s_ap_name[25], s_ap_password[17], s_token[33], s_ip_text[24];
 static uint8_t s_bssid[6];
 static lv_obj_t *s_screen, *s_status, *s_details, *s_hint, *s_battery, *s_volume_label;
 static const char *TAG = "passport";
+
+/* Stage F avatar geometry, in screen pixels. The face box sits between the
+   status line and the detail lines; only objects inside it are invalidated. */
+#define FACE_X 44
+#define FACE_Y 92
+#define FACE_W 152
+#define FACE_H 130
+#define EYE_W 40
+#define EYE_MAX_H 56
+#define EYE_MIN_H 4
+#define EYE_Y 16
+#define EYE_L_X 20
+#define EYE_R_X 92
+#define PUPIL_W 14
+#define PUPIL_H 18
+#define MOUTH_W 52
+#define MOUTH_MAX_H 36
+#define MOUTH_MIN_H 4
+#define MOUTH_Y 92
+
+static void face_apply(const pv_face_out_t *out);
+static void face_timer_cb(lv_timer_t *timer);
 
 static void audio_ws_sync(void);
 static void audio_ws_lost(void);
@@ -156,6 +185,11 @@ static void show(const char *status, const char *hint)
     lv_label_set_text_fmt(s_volume_label,"Volume %u",(unsigned)s_volume);
     if (battery < 0) lv_label_set_text(s_battery, "--");
     else lv_label_set_text_fmt(s_battery, "%d%%", battery);
+    /* Setup reuses the face area for the password; hide the avatar then. */
+    if (s_face_box) {
+        if (s_setup) lv_obj_add_flag(s_face_box, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(s_face_box, LV_OBJ_FLAG_HIDDEN);
+    }
     bsp_lvgl_unlock();
 }
 /* Wi-Fi is connected; report the gateway handshake phase instead of a bare
@@ -196,6 +230,64 @@ static lv_obj_t *label(int y, int height, const lv_font_t *font)
     lv_label_set_long_mode(o, LV_LABEL_LONG_WRAP);
     return o;
 }
+
+/* Map the 0..100 face model onto five plain objects. Sizes change, positions
+   stay inside the face box, so only that region is invalidated. */
+static void face_apply(const pv_face_out_t *out)
+{
+    const int eye_h = EYE_MIN_H + (int)out->eye_open * (EYE_MAX_H - EYE_MIN_H) / 100;
+    const int eye_y = EYE_Y + (EYE_MAX_H - eye_h) / 2;
+    const int mouth_h = MOUTH_MIN_H + (int)out->mouth_open * (MOUTH_MAX_H - MOUTH_MIN_H) / 100;
+    lv_obj_set_pos(s_eye_l, EYE_L_X, eye_y);
+    lv_obj_set_size(s_eye_l, EYE_W, eye_h);
+    lv_obj_set_pos(s_eye_r, EYE_R_X, eye_y);
+    lv_obj_set_size(s_eye_r, EYE_W, eye_h);
+
+    if (out->eye_open < PV_FACE_PUPIL_MIN_OPEN) {
+        lv_obj_add_flag(s_pupil_l, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_pupil_r, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        /* Pupil travel is bounded to the eye it sits in. */
+        const int dx = (int)out->pupil_dx - 50;
+        const int dy = (int)out->pupil_dy - 50;
+        const int px = EYE_W / 2 - PUPIL_W / 2 + dx * (EYE_W - PUPIL_W) / 100;
+        const int py = eye_h / 2 - PUPIL_H / 2 + dy * (eye_h - PUPIL_H) / 100;
+        lv_obj_set_pos(s_pupil_l, EYE_L_X + px, eye_y + py);
+        lv_obj_set_pos(s_pupil_r, EYE_R_X + px, eye_y + py);
+        lv_obj_remove_flag(s_pupil_l, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_pupil_r, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_obj_set_pos(s_mouth, (FACE_W - MOUTH_W) / 2, MOUTH_Y + (MOUTH_MAX_H - mouth_h) / 2);
+    lv_obj_set_size(s_mouth, MOUTH_W, mouth_h);
+}
+
+/* Runs on the LVGL task (priority 4, below every audio task). 10 Hz is enough
+   for the blink and mouth shapes; the status line stays the precise signal. */
+static void face_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!s_face_box || lv_obj_has_flag(s_face_box, LV_OBJ_FLAG_HIDDEN)) return;
+    const char *text = lv_label_get_text(s_status);
+    pv_face_out_t out;
+    pv_face_tick(&s_face, (uint32_t)(esp_timer_get_time() / 1000),
+                 esp_random(), pv_face_state_for_status(text),
+                 atomic_load(&s_mouth_level), &out);
+    face_apply(&out);
+}
+
+static lv_obj_t *face_part(lv_color_t color, int radius)
+{
+    lv_obj_t *o = lv_obj_create(s_face_box);
+    lv_obj_set_style_bg_color(o, color, 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(o, radius, 0);
+    lv_obj_set_style_border_width(o, 0, 0);
+    lv_obj_set_style_pad_all(o, 0, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    return o;
+}
+
 static bool ui_start(void)
 {
     if (!bsp_lvgl_lock(1000)) return false;
@@ -208,12 +300,35 @@ static bool ui_start(void)
     s_battery=label(18,25,&lv_font_montserrat_14);
     lv_obj_set_pos(s_battery,174,18); lv_obj_set_width(s_battery,48);
     lv_obj_set_style_text_align(s_battery, LV_TEXT_ALIGN_RIGHT,0);
-    s_status=label(55,52,&lv_font_montserrat_20);
+    s_status=label(52,30,&lv_font_montserrat_20);
     lv_obj_set_style_text_color(s_status,lv_color_hex(0x64DEC7),0);
-    s_details=label(111,140,&lv_font_montserrat_14);
-    s_volume_label=label(240,20,&lv_font_montserrat_14);
-    s_hint=label(263,42,&lv_font_montserrat_14);
+    s_details=label(226,34,&lv_font_montserrat_14);
+    s_volume_label=label(258,18,&lv_font_montserrat_14);
+    s_hint=label(276,36,&lv_font_montserrat_14);
     lv_label_set_text(s_status,"Starting...");
+
+    /* Stage F: five plain objects, no images, no extra frame buffer. */
+    s_face_box = lv_obj_create(s_screen);
+    lv_obj_set_pos(s_face_box, FACE_X, FACE_Y);
+    lv_obj_set_size(s_face_box, FACE_W, FACE_H);
+    lv_obj_set_style_bg_opa(s_face_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_face_box, 0, 0);
+    lv_obj_set_style_pad_all(s_face_box, 0, 0);
+    lv_obj_remove_flag(s_face_box, LV_OBJ_FLAG_SCROLLABLE);
+    s_eye_l = face_part(lv_color_hex(0xE9F1F5), LV_RADIUS_CIRCLE);
+    s_eye_r = face_part(lv_color_hex(0xE9F1F5), LV_RADIUS_CIRCLE);
+    s_pupil_l = face_part(lv_color_hex(0x10212C), LV_RADIUS_CIRCLE);
+    s_pupil_r = face_part(lv_color_hex(0x10212C), LV_RADIUS_CIRCLE);
+    lv_obj_set_size(s_pupil_l, PUPIL_W, PUPIL_H);
+    lv_obj_set_size(s_pupil_r, PUPIL_W, PUPIL_H);
+    s_mouth = face_part(lv_color_hex(0x64DEC7), 8);
+    pv_face_init(&s_face, (uint32_t)(esp_timer_get_time() / 1000), esp_random());
+    pv_face_out_t initial;
+    pv_face_tick(&s_face, (uint32_t)(esp_timer_get_time() / 1000), esp_random(),
+                 PV_FACE_IDLE, PV_FACE_MOUTH_NONE, &initial);
+    face_apply(&initial);
+    s_face_timer = lv_timer_create(face_timer_cb, 100, NULL);
+
     lv_screen_load(s_screen); bsp_lvgl_unlock(); return true;
 }
 static void random_hex(char *out, size_t bytes)
@@ -853,6 +968,16 @@ static void play_task(void *arg)
             if (e == ESP_OK) {
                 (void)xQueueReceive(s_down_queue, &frame, 0);
                 last_write = esp_timer_get_time();
+                /* Peak over the 480 PCM16 samples of one 20 ms frame. */
+                uint16_t peak = 0;
+                for (size_t i = 0; i + 1 < frame.len; i += 2) {
+                    int16_t sample = (int16_t)((uint16_t)frame.data[i] |
+                                               (uint16_t)frame.data[i + 1] << 8);
+                    uint16_t mag = sample < 0 ? (uint16_t)(-sample) : (uint16_t)sample;
+                    if (mag > peak) peak = mag;
+                }
+                uint32_t level = ((uint32_t)peak * 100u) / 32768u;
+                atomic_store(&s_mouth_level, (unsigned char)(level > 100u ? 100u : level));
             } else if (!write_failed) {
                 write_failed = true;
                 pv_audio_note_pending(&s_pending, PV_AUDIO_PENDING_PLAY_FAILED);

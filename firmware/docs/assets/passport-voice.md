@@ -1,8 +1,14 @@
 [简体中文](passport-voice.zh_CN.md) · **English**
 
-# Passport Voice — implemented Stages A–E
+# Passport Voice — implemented Stages A–E, Stage F in review
 
-Status (2026-10-19): all five stages are implemented and device-verified; firmware `9ee8a4f5…` is running on the device. The approved direction was LAN WebSocket, a gateway PCM extension, and temporary SoftAP first-time provisioning; the scope grew stage by stage as recorded below. Per-stage acceptance checklists are kept as written before execution — see the repository-level `DELIVERY.md` for the observed results.
+Status (2026-10-19): Stages A–E are implemented and device-verified; firmware
+`9ee8a4f5…` is running on the device. Stage F (state-driven avatar) is
+implemented and gate-verified but not yet flashed. The approved direction was
+LAN WebSocket, a gateway PCM extension, and temporary SoftAP first-time
+provisioning; the scope grew stage by stage as recorded below. Per-stage
+acceptance checklists are kept as written before execution — see the
+repository-level `DELIVERY.md` for the observed results.
 
 ## Implementation plan and boundaries
 
@@ -92,3 +98,41 @@ Test first boot and WPA2 AP access; correct, wrong, and unavailable STA credenti
 - Transport connectivity and voice-backend readiness are separate. Backend startup/failure and a bounded response timeout leave an actionable recoverable state instead of endless Thinking. Keep half-duplex playback/capture and stream framing unchanged.
 - Retain only bounded counters, heap/largest-block and task stack diagnostics; no credentials or private transcripts in added logs. No UI beautification, dependency installation, flashing, commits, pushes, or restarting the active gateway during implementation.
 - Validate manual/automatic turn boundaries, empty/short/duplicate stops, volume compatibility/persistence, retry and backend recovery, and a new utterance after playback. Run static/firmware/archive gates and gateway tests, then independent review before device testing.
+
+## Stage F (implemented, device acceptance pending)
+
+A state-driven avatar drawn from five plain LVGL objects (two eyes, two
+pupils, one mouth) inside a fixed box between the status line and the detail
+lines. No images, no canvas, no extra frame buffer: only those objects are
+invalidated, so rendering stays inside the existing 40-line partial buffer.
+The English status line remains, so the avatar never hides a state.
+
+Animation decisions live in `main/passport_face.c`, a pure module with no LVGL
+or audio includes, covered by `tests/test_passport_face.c`. The app maps its
+0–100 outputs onto object geometry. A 100 ms LVGL timer (priority 4, below
+every audio task at 6) drives it; the play task publishes a per-frame PCM peak
+to one atomic that the timer reads, so the audio path takes no extra lock.
+
+Mapping: Ready/Starting/Connecting blink; Listening opens the eyes wide;
+Thinking sweeps the pupils; Speaking opens the mouth with the playback level
+(immediate attack, ~500 ms decay); Retrying sweeps slowly; Audio error, Send
+failed, Voice unavailable and the setup/storage errors droop the eyes. The
+avatar hides while the setup screen is open.
+
+The gateway's Grok PCM path sends no expression messages, so the face follows
+device state only. The gateway can emit `{"type":"llm","emotion":...}` for MCP
+clients, but the firmware ignores that type today.
+
+### Stage F device acceptance (not yet run)
+
+1. Boot and confirm the face appears under the status line, blinks at Ready,
+   and the status text stays readable.
+2. Hold OK: eyes widen at once; release: pupils sweep during Thinking.
+3. On a reply, the mouth opens and closes with the speech and the audio stays
+   continuous; hold a reply longer than 30 s and confirm no stutter.
+4. Stop the gateway: the face droops into the error look at Retrying/Audio
+   error and returns to blinking once Ready again.
+5. Hold UP for setup: the avatar hides and the password stays readable; cancel
+   and confirm the avatar returns.
+6. Compare the boot `heap=`/`largest=` log with Stage E (121348/110592) and
+   confirm the drop stays small.
