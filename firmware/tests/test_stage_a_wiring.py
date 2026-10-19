@@ -515,6 +515,16 @@ int main(void){
         self.assertIn("pv_face_tick", self.app)
         self.assertIn("s_mouth_level", function_body(self.app, "play_task"))
 
+    def test_ok_during_playback_cancels_locally_and_upstream(self) -> None:
+        # Stage G: pressing OK while the reply plays stops playback at once and
+        # tells the gateway to cancel, so the tail cannot leak into next turn.
+        press = function_body(self.app, "process")
+        self.assertIn("audio_playback_cancel();return;", press)
+        cancel = function_body(self.app, "audio_playback_cancel")
+        self.assertIn("audio_downlink_clear()", cancel)
+        self.assertIn('"{\\"type\\":\\"abort\\"}"', cancel)
+        self.assertNotIn("audio_press", cancel)
+
 
 if __name__ == "__main__":
     unittest.main()

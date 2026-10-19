@@ -1136,6 +1136,24 @@ static void audio_downlink_stop(void)
     show_online();
 }
 
+/* Stage G: OK during playback cuts the reply short. This is a local stop, not
+   barge-in: playback ends immediately and the gateway is told to cancel the
+   in-flight response so its tail cannot leak into the next turn. */
+static void audio_playback_cancel(void)
+{
+    if (s_down.state != PV_DOWN_SPEAKING && s_down.state != PV_DOWN_DRAINING) return;
+    (void)pv_down_event(&s_down, PV_DOWN_EV_LOST);
+    audio_downlink_clear();
+    if (atomic_exchange(&s_down_format_24k, false))
+        (void)audio_set_format_locked(16000);
+    atomic_store(&s_mouth_level, 0);
+    if (s_ws.state == PV_WS_READY) {
+        static const char abort_msg[] = "{\"type\":\"abort\"}";
+        (void)ws_send_text_locked(abort_msg, sizeof(abort_msg) - 1);
+    }
+    show_online();
+}
+
 /* listen.stop is sent exactly once per utterance, from the owner task. */
 static void audio_stop_complete(void)
 {
@@ -1290,6 +1308,9 @@ static void process(const app_event_t *e)
             show_online();return;
         }
         if(e->key==BSP_BTN_OK && e->key_event==BSP_BTN_PRESS){
+            if(s_down.state==PV_DOWN_SPEAKING || s_down.state==PV_DOWN_DRAINING){
+                audio_playback_cancel();return;
+            }
             if(s_ws.state!=PV_WS_READY || s_backend!=1){
                 if(s_model.state==PV_FAILED && s_model.has_saved)request_attempt(&s_saved,false);
                 else {ws_restart();show_online();}
