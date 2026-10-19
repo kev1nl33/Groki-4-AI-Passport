@@ -525,6 +525,15 @@ int main(void){
         self.assertIn('"{\\"type\\":\\"abort\\"}"', cancel)
         self.assertNotIn("audio_press", cancel)
 
+    def test_gateway_token_goes_to_the_header_only(self) -> None:
+        # Stage G: the token rides the WebSocket handshake and is never logged.
+        start = function_body(self.app, "ws_start")
+        self.assertIn("Authorization: Bearer", start)
+        self.assertIn("cfg.headers", start)
+        self.assertNotIn("auth_token", [ln for ln in start.splitlines() if "ESP_LOG" in ln])
+        self.assertIn("pv_config_from_blob", function_body(self.app, "load_saved"))
+        self.assertIn('name=auth', function_body(self.app, "get_form"))
+
 
 if __name__ == "__main__":
     unittest.main()

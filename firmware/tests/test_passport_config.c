@@ -1,5 +1,6 @@
 #include "passport_config.h"
 #include <assert.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -9,7 +10,13 @@ static void forms(void)
     assert(pv_parse_form("ssid=Home+WiFi&pass=12345678&gateway=ws%3A%2F%2F192.168.1.2%3A8765&token=abc", "abc", &c) == PV_VALID);
     assert(!strcmp(c.ssid, "Home WiFi"));
     assert(!strcmp(c.gateway, "ws://192.168.1.2:8765"));
+    assert(c.auth_token[0] == 0); /* token stays optional */
     assert(c.version == PV_CONFIG_VERSION);
+    assert(pv_parse_form("ssid=x&pass=&gateway=ws://host:8765&auth=s3cret-token&token=abc", "abc", &c) == PV_VALID);
+    assert(!strcmp(c.auth_token, "s3cret-token"));
+    assert(pv_parse_form("ssid=x&pass=&gateway=ws://host:8765&auth=&token=abc", "abc", &c) == PV_VALID);
+    assert(c.auth_token[0] == 0);
+    assert(pv_parse_form("ssid=x&pass=&gateway=ws://host:8765&auth=bad%0Atoken&token=abc", "abc", &c) == PV_BAD_FORM);
     assert(pv_parse_form("ssid=x&pass=&gateway=ws://host:8765&token=wrong", "abc", &c) == PV_BAD_TOKEN);
     assert(pv_parse_form("ssid=%00x&pass=&gateway=ws://host:8765&token=abc", "abc", &c) == PV_BAD_FORM);
     assert(pv_parse_form("ssid=%GG&pass=&gateway=ws://host:8765&token=abc", "abc", &c) == PV_BAD_FORM);
@@ -29,6 +36,17 @@ static void forms(void)
     assert(pv_config_valid(&c));
     c.version++; assert(!pv_config_valid(&c));
     c.version=PV_CONFIG_VERSION; memset(c.ssid,'a',sizeof(c.ssid)); assert(!pv_config_valid(&c));
+
+    /* A stored v1 blob (no auth token field) loads with an empty token. */
+    pv_config_t v1 = {.version = PV_CONFIG_VERSION_V1};
+    strcpy(v1.ssid, "home"); strcpy(v1.gateway, "ws://host:8765");
+    const size_t v1_len = offsetof(pv_config_t, auth_token);
+    pv_config_t loaded = {0};
+    assert(pv_config_from_blob(&v1, v1_len, &loaded));
+    assert(loaded.version == PV_CONFIG_VERSION);
+    assert(!strcmp(loaded.ssid, "home") && loaded.auth_token[0] == 0);
+    assert(pv_config_from_blob(&v1, v1_len - 1, &loaded) == false);
+    v1.version = 9; assert(pv_config_from_blob(&v1, v1_len, &loaded) == false);
 }
 
 static void model(void)

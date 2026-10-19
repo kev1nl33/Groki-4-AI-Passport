@@ -365,7 +365,18 @@ static esp_err_t get_form(httpd_req_t *req)
 {
     if (!header_equals(req,"Host","192.168.4.1",false)) return respond(req,"403 Forbidden","请使用 http://192.168.4.1 打开配网页。");
     char page[1900];
-    snprintf(page,sizeof(page),"<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Passport 配网</title><style>body{font:18px system-ui;max-width:28em;margin:2em auto;padding:16px;background:#10212c;color:#e9f1f5}input,button{box-sizing:border-box;width:100%%;padding:12px;margin:8px 0 20px;font:inherit}button{background:#64dec7;border:0}</style><h1>连接 Passport</h1><p>输入 2.4 GHz Wi-Fi。拿到 IP 后才保存；网关地址本阶段只保存，不连接。</p><form method=post action=/configure><input type=hidden name=token value='%s'><label>Wi-Fi 名称<input name=ssid maxlength=32 required autocomplete=off></label><label>Wi-Fi 密码（开放网络留空）<input name=pass type=password maxlength=63 autocomplete=new-password></label><label>网关地址<input name=gateway maxlength=191 placeholder='ws://192.168.1.2:8765' required></label><button>验证并保存</button></form><p>请留意设备屏幕。失败可重新提交，OK 可取消并恢复旧配置。</p></html>",s_token);
+    /* Pre-fill the saved token so re-provisioning does not silently drop it.
+       It is HTML-escaped; the value never reaches the log. */
+    char escaped[PV_AUTH_TOKEN_MAX * 6 + 1];
+    size_t ei = 0;
+    for (const char *p = s_saved.auth_token; *p && ei + 6 < sizeof(escaped); ++p) {
+        const char *rep = *p == '<' ? "&lt;" : *p == '>' ? "&gt;" :
+                          *p == '&' ? "&amp;" : *p == '\'' ? "&#39;" : NULL;
+        if (rep) { ei += (size_t)snprintf(escaped + ei, sizeof(escaped) - ei, "%s", rep); }
+        else escaped[ei++] = *p;
+    }
+    escaped[ei] = 0;
+    snprintf(page,sizeof(page),"<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Passport 配网</title><style>body{font:18px system-ui;max-width:28em;margin:2em auto;padding:16px;background:#10212c;color:#e9f1f5}input,button{box-sizing:border-box;width:100%%;padding:12px;margin:8px 0 20px;font:inherit}button{background:#64dec7;border:0}</style><h1>连接 Passport</h1><p>输入 2.4 GHz Wi-Fi。拿到 IP 后才保存；网关地址本阶段只保存，不连接。</p><form method=post action=/configure><input type=hidden name=token value='%s'><label>Wi-Fi 名称<input name=ssid maxlength=32 required autocomplete=off></label><label>Wi-Fi 密码（开放网络留空）<input name=pass type=password maxlength=63 autocomplete=new-password></label><label>网关地址<input name=gateway maxlength=191 placeholder='ws://192.168.1.2:8765' required></label><label>网关令牌（与电脑端一致，不用则留空）<input name=auth maxlength=64 value='%s' autocomplete=off></label><button>验证并保存</button></form><p>请留意设备屏幕。失败可重新提交，OK 可取消并恢复旧配置。</p></html>",s_token,escaped);
     return respond(req,"200 OK",page);
 }
 static esp_err_t post_form(httpd_req_t *req)
@@ -485,16 +496,20 @@ static esp_err_t load_saved(void)
     if(e!=ESP_OK)return e;
     uint8_t volume = 50;
     if(nvs_get_u8(h,"volume",&volume)==ESP_OK && volume<=100)s_volume=volume;
-    size_t n=sizeof(s_saved);
-    e=nvs_get_blob(h,"config_v1",&s_saved,&n);
+    size_t n=0;
+    e=nvs_get_blob(h,"config_v1",NULL,&n);
+    if(e==ESP_ERR_NVS_NOT_FOUND){nvs_close(h);return ESP_OK;} /* nothing stored yet */
+    if(e!=ESP_OK){nvs_close(h);return e;}                     /* real NVS read failure */
+    uint8_t raw[sizeof(pv_config_t)];
+    if(n>sizeof(raw)){nvs_close(h);ESP_LOGW(TAG,"stored config too large (%u); entering setup",(unsigned)n);return ESP_OK;}
+    size_t got=n;
+    e=nvs_get_blob(h,"config_v1",raw,&got);
     nvs_close(h);
-    if(e==ESP_ERR_NVS_NOT_FOUND)return ESP_OK; /* nothing stored yet */
-    if(e!=ESP_OK)return e;                     /* real NVS read failure */
-    /* A blob with another size/version or invalid content is stale data, not
-       a storage failure: fall back to first-time setup and keep NVS intact. */
-    if(n!=sizeof(s_saved) || !pv_config_valid(&s_saved)){
-        ESP_LOGW(TAG,"stored config rejected (len=%u ver=%u); entering setup",
-                 (unsigned)n,(unsigned)s_saved.version);
+    if(e!=ESP_OK)return e;
+    /* v1 blobs stay usable with an empty token; anything unreadable falls
+       back to first-time setup and keeps the stored blob untouched. */
+    if(!pv_config_from_blob(raw,got,&s_saved)){
+        ESP_LOGW(TAG,"stored config rejected (len=%u); entering setup",(unsigned)got);
         memset(&s_saved,0,sizeof(s_saved));
         return ESP_OK;
     }
@@ -748,6 +763,14 @@ static esp_err_t ws_start(void)
     cfg.network_timeout_ms = 10000;
     cfg.buffer_size = 1024;
     cfg.task_stack = 6144; /* Stage D parses bounded JSON in the callback */
+    /* Plain ws:// plus a shared token: a LAN hurdle, not encryption. The
+       header is built on the stack and copied by the client before return. */
+    char auth_header[sizeof("Authorization: Bearer \r\n") + PV_AUTH_TOKEN_MAX];
+    if (s_active.auth_token[0]) {
+        int hn = snprintf(auth_header, sizeof(auth_header),
+                          "Authorization: Bearer %s\r\n", s_active.auth_token);
+        if (hn > 0 && (size_t)hn < sizeof(auth_header)) cfg.headers = auth_header;
+    }
     s_ws_client = esp_websocket_client_init(&cfg);
     if (!s_ws_client) {
         ESP_LOGE(TAG, "websocket init failed");

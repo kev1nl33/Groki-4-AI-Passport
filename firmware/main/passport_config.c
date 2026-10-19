@@ -77,11 +77,33 @@ static pv_validation_t validate(const pv_config_t *c)
     size_t n = strlen(c->password);
     if (n && (n < 8 || n > 63 || !printable(c->password))) return PV_BAD_PASSWORD;
     if (!terminated(c->gateway, sizeof(c->gateway)) || !pv_gateway_valid(c->gateway)) return PV_BAD_GATEWAY;
+    if (!terminated(c->auth_token, sizeof(c->auth_token)) || !printable(c->auth_token)) return PV_BAD_FORM;
     return PV_VALID;
 }
 bool pv_config_valid(const pv_config_t *c)
 {
     return c && c->version == PV_CONFIG_VERSION && validate(c) == PV_VALID;
+}
+bool pv_config_from_blob(const void *blob, size_t len, pv_config_t *out)
+{
+    if (!blob || !out) return false;
+    /* v1 predates the auth token: accept it and treat the token as empty. */
+    const size_t v1 = offsetof(pv_config_t, auth_token);
+    if (len == v1) {
+        pv_config_t c;
+        memset(&c, 0, sizeof(c));
+        memcpy(&c, blob, v1);
+        if (c.version != PV_CONFIG_VERSION_V1 || validate(&c) != PV_VALID) return false;
+        c.version = PV_CONFIG_VERSION;
+        *out = c;
+        return true;
+    }
+    if (len != sizeof(pv_config_t)) return false;
+    pv_config_t c;
+    memcpy(&c, blob, sizeof(c));
+    if (!pv_config_valid(&c)) return false;
+    *out = c;
+    return true;
 }
 pv_validation_t pv_parse_form(const char *body, const char *token, pv_config_t *out)
 {
@@ -100,6 +122,7 @@ pv_validation_t pv_parse_form(const char *body, const char *token, pv_config_t *
         if (key == 4 && !memcmp(p,"ssid",4)) { bit=1; dest=c.ssid; cap=sizeof(c.ssid); }
         else if (key == 4 && !memcmp(p,"pass",4)) { bit=2; dest=c.password; cap=sizeof(c.password); }
         else if (key == 7 && !memcmp(p,"gateway",7)) { bit=4; dest=c.gateway; cap=sizeof(c.gateway); }
+        else if (key == 4 && !memcmp(p,"auth",4)) { bit=16; dest=c.auth_token; cap=sizeof(c.auth_token); }
         else if (key == 5 && !memcmp(p,"token",5)) { bit=8; dest=supplied; cap=sizeof(supplied); }
         else return PV_BAD_FORM;
         if ((seen & bit) || !decode(eq+1,(size_t)(end-eq-1),dest,cap)) return PV_BAD_FORM;
@@ -107,11 +130,12 @@ pv_validation_t pv_parse_form(const char *body, const char *token, pv_config_t *
         p = *end ? end+1 : end;
         if (*end && !*p) return PV_BAD_FORM;
     }
-    if (seen != 15) return PV_BAD_FORM;
+    if ((seen & 15) != 15 || (seen & ~31u)) return PV_BAD_FORM;
     if (strcmp(token, supplied)) return PV_BAD_TOKEN;
     pv_validation_t result = validate(&c);
     if (result == PV_VALID) *out = c;
     memset(c.password, 0, sizeof(c.password));
+    memset(c.auth_token, 0, sizeof(c.auth_token));
     return result;
 }
 void pv_begin(pv_model_t *m, bool h, bool c)
