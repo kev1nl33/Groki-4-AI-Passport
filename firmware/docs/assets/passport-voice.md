@@ -1,14 +1,16 @@
 [简体中文](passport-voice.zh_CN.md) · **English**
 
-# Passport Voice — implemented Stages A–E, Stage F in review
+# Passport Voice — implemented Stages A–F
 
-Status (2026-10-19): Stages A–E are implemented and device-verified; firmware
-`9ee8a4f5…` is running on the device. Stage F (state-driven avatar) is
-implemented and gate-verified but not yet flashed. The approved direction was
-LAN WebSocket, a gateway PCM extension, and temporary SoftAP first-time
-provisioning; the scope grew stage by stage as recorded below. Per-stage
-acceptance checklists are kept as written before execution — see the
-repository-level `DELIVERY.md` for the observed results.
+Status (2026-10-19): Stages A–F are implemented and device-verified. Stage F
+(state-driven avatar, firmware `29567dc1…`) passed device acceptance: the face
+blinks at Ready, opens wide while listening, sweeps its pupils while thinking,
+mouths along with speech without audio stutter, and the setup screen shows the
+hotspot password in full. The approved direction was LAN WebSocket, a gateway
+PCM extension, and temporary SoftAP first-time provisioning; the scope grew
+stage by stage as recorded below. Per-stage acceptance checklists are kept as
+written before execution — see the repository-level `DELIVERY.md` for the
+observed results.
 
 ## Implementation plan and boundaries
 
@@ -99,7 +101,7 @@ Test first boot and WPA2 AP access; correct, wrong, and unavailable STA credenti
 - Retain only bounded counters, heap/largest-block and task stack diagnostics; no credentials or private transcripts in added logs. No UI beautification, dependency installation, flashing, commits, pushes, or restarting the active gateway during implementation.
 - Validate manual/automatic turn boundaries, empty/short/duplicate stops, volume compatibility/persistence, retry and backend recovery, and a new utterance after playback. Run static/firmware/archive gates and gateway tests, then independent review before device testing.
 
-## Stage F (implemented, device acceptance pending)
+## Stage F (implemented, device-verified 2026-10-19)
 
 A state-driven avatar drawn from five plain LVGL objects (two eyes, two
 pupils, one mouth) inside a fixed box between the status line and the detail
