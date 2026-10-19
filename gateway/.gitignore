@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Environment / secrets
+# Local list of private words for tests/test_public_wording.py; never commit it.
+tests/private_wordlist.txt
+.env
+.env.local
+*.local
+
+# Captures (user photos)
+captures/
+
+# Local wake word model
+models/kws/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.zip
+build/
+dist/
+.debug-memleak/
