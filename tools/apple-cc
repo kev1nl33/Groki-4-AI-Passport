@@ -1,0 +1,12 @@
+#!/bin/bash
+# 将门禁使用的 GNU 无用段清理参数转换成 Apple ld 的对应参数。
+set -euo pipefail
+args=()
+for arg in "$@"; do
+    if [[ "$arg" == "-Wl,--gc-sections" ]]; then
+        args+=("-Wl,-dead_strip")
+    else
+        args+=("$arg")
+    fi
+done
+exec /usr/bin/cc "${args[@]}"
