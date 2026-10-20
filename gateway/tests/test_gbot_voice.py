@@ -69,6 +69,23 @@ def test_streaming_resampling_matches_single_chunk():
 
 
 @pytest.mark.asyncio
+async def test_cancel_before_response_created_suppresses_late_response():
+    b = bridge()
+    b._send = AsyncMock()
+    b._response_requested = True
+    await b.interrupt()
+    assert b._send.call_args.args[0] == {"type": "response.cancel"}
+    with pytest.raises(RuntimeError, match="cancellation_pending"):
+        await b.inject_user_text("next notification")
+    await b._handle_event({"type": "response.created", "response": {"id": "late"}})
+    await b._handle_event({"type": "response.audio.delta", "response_id": "late",
+                          "delta": base64.b64encode(b"\x00\x00" * 240).decode()})
+    b._on_audio.assert_not_awaited()
+    assert "late" in b._suppressed
+    assert b._send.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_interrupt_discards_late_old_audio_and_accepts_next_turn():
     b = bridge()
     b._send = AsyncMock()

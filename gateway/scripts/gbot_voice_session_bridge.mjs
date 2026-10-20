@@ -117,7 +117,16 @@ export class NativeSandboxClient {
   }
   async #fetch(path, options = {}) {
     const connection = await this.#connect();
-    return this.fetcher(connection.baseUrl + path, {...options, redirect: 'error', headers: {...connection.headers, ...options.headers}});
+    try {
+      const response = await this.fetcher(connection.baseUrl + path, {...options, redirect: 'error', headers: {...connection.headers, ...options.headers}});
+      if ([401, 403, 502, 503, 504].includes(response.status) && this.#connection === connection) this.#connection = undefined;
+      return response;
+    } catch (error) {
+      // A caller cancellation does not invalidate the shared connection. Never
+      // replay requests here: a POST may already have reached the server.
+      if (!options.signal?.aborted && this.#connection === connection) this.#connection = undefined;
+      throw error;
+    }
   }
   async openEvents(signal) {
     const deadline = new AbortController();
@@ -285,10 +294,19 @@ function waitForNativeRetry(milliseconds, signal) {
   });
 }
 
-export function createBridge({ port = 18771, rpc = accountRpc, agentId = process.env.STACKCHAN_GBOT_VOICE_BOT_ID || process.env.STACKCHAN_GBOT_VOICE_AGENT_ID || process.env.STACKCHAN_TOOL_BOT_ID, toolsEnabled = process.env.STACKCHAN_GBOT_VOICE_TOOLS === '1', desktopEnabled = Boolean(process.env.STACKCHAN_TOOL_BOT?.trim()) || process.env.STACKCHAN_GBOT_VOICE_DESKTOP === '1', sandbox = new NativeSandboxClient({connectMode: 'normal'}), transcript = new NativeTranscriptClient(), nativeRetryDelayMs = 5000, nativeLog = event => console.log(JSON.stringify({event: 'gbot_native_stream', ...event})), sessionId = process.env.STACKCHAN_GBOT_VOICE_SESSION_ID || '' } = {}) {
+export function createBridge({ port = 18771, rpc = accountRpc, agentId = process.env.STACKCHAN_GBOT_VOICE_BOT_ID || process.env.STACKCHAN_GBOT_VOICE_AGENT_ID || process.env.STACKCHAN_TOOL_BOT_ID, toolsEnabled = process.env.STACKCHAN_GBOT_VOICE_TOOLS === '1', desktopEnabled = Boolean(process.env.STACKCHAN_TOOL_BOT?.trim()) || process.env.STACKCHAN_GBOT_VOICE_DESKTOP === '1', sandbox = new NativeSandboxClient({connectMode: 'normal'}), transcript = new NativeTranscriptClient(), nativeRetryDelayMs = 5000, nativeRegistrationGraceMs = 30000, nativeLog = event => console.log(JSON.stringify({event: 'gbot_native_stream', ...event})), sessionId = process.env.STACKCHAN_GBOT_VOICE_SESSION_ID || '' } = {}) {
   if (!Number.isFinite(nativeRetryDelayMs) || nativeRetryDelayMs < 10 || nativeRetryDelayMs > 30000) throw new Error('invalid_native_retry_delay');
   const logStream = (source, state, extra = {}) => nativeLog({source, state, ...extra});
+  if (!Number.isFinite(nativeRegistrationGraceMs) || nativeRegistrationGraceMs < 10 || nativeRegistrationGraceMs > 30000) throw new Error('invalid_registration_grace');
   let activeCall = null;
+  const clearRegistration = context => clearTimeout(context?.registrationTimer);
+  const armRegistration = context => {
+    clearRegistration(context);
+    context.registrationTimer = setTimeout(() => {
+      if (activeCall === context && context.streams.size === 0) activeCall = null;
+    }, nativeRegistrationGraceMs);
+    context.registrationTimer.unref();
+  };
   let presenceBusy = false;
   const streams = new Set();
   return createServer(async (req, res) => {
@@ -307,7 +325,17 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       if (!desktopEnabled && !toolsEnabled) return send(403, {ok: false, error: 'desktop_disabled'});
       if ([...eventUrl.searchParams.keys()].some(k => !['agentId', 'callId'].includes(k)) || !activeCall || eventUrl.searchParams.get('agentId') !== agentId || eventUrl.searchParams.get('callId') !== activeCall.callId) return send(403, {ok: false, error: 'call_not_allowed'});
       const context = activeCall, controller = new AbortController();
-      streams.add(controller); res.on('close', () => controller.abort());
+      streams.add(controller);
+      context.streams.add(controller);
+      clearRegistration(context);
+      const release = () => {
+        controller.abort();
+        context.streams.delete(controller);
+        // Release at socket close, not after slow upstream cleanup. A late
+        // finally belongs to this context and must never clear its successor.
+        if (activeCall === context && context.streams.size === 0) activeCall = null;
+      };
+      res.on('close', release);
       let typedTask;
       try {
         const upstream = await sandbox.openEvents(controller.signal);
@@ -365,7 +393,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         if (!controller.signal.aborted) logStream('box', 'error', streamFailure(error));
         if (!res.headersSent) send(502, {ok: false, error: 'native_stream_failed'});
       } finally {
-        controller.abort();
+        release();
         await typedTask;
         streams.delete(controller);
         res.end();
@@ -402,9 +430,11 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         const authId = await sandbox.callerAuthId();
         await sandbox.presence(body);
         if (body.isOnTheLine) {
-          if (!activeCall) activeCall = {agentId, callId: body.callId, acceptsOverheard: body.acceptsOverheard, sessionId, authId, sinceMs: Date.now(), seen: new Set()};
+          if (!activeCall) activeCall = {agentId, callId: body.callId, acceptsOverheard: body.acceptsOverheard, sessionId, authId, sinceMs: Date.now(), seen: new Set(), streams: new Set()};
           else activeCall.acceptsOverheard = body.acceptsOverheard;
+          if (activeCall.streams.size === 0) armRegistration(activeCall);
         } else {
+          clearRegistration(activeCall);
           activeCall = null; for (const controller of streams) controller.abort();
         }
         return send(200, {ok: true});

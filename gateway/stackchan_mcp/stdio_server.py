@@ -586,6 +586,33 @@ def create_server() -> Server:
                     "required": ["text"],
                 },
             ),
+            Tool(
+                name="notify",
+                description=(
+                    "Queue a short proactive announcement on the device "
+                    "speaker (Stage H). The gateway waits for the device to "
+                    "be idle, then the live voice session says the text in "
+                    "the assistant's own voice. Bounded by length and rate "
+                    "limits; fails clearly when the device is offline."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": (
+                                "Announcement text (max 100 characters)."
+                            ),
+                        },
+                        "flash": {
+                            "type": "boolean",
+                            "description": "Also flash the on-screen notice.",
+                            "default": False,
+                        },
+                    },
+                    "required": ["text"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -623,6 +650,43 @@ def create_server() -> Server:
                     )
                 ]
             return [TextContent(type="text", text=json.dumps(result))]
+
+        if name == "notify":
+            # Stage H: queue a proactive announcement through the same
+            # service the loopback HTTP endpoint uses.
+            service = getattr(gw, "notify_service", None)
+            if service is None:
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "error": (
+                                    "notify disabled: set STACKCHAN_NOTIFY_TOKEN "
+                                    "(or STACKCHAN_TOKEN) and restart the gateway"
+                                )
+                            }
+                        ),
+                    )
+                ]
+            text_arg = arguments.get("text", "")
+            flash_arg = arguments.get("flash", False)
+            if not isinstance(text_arg, str) or not isinstance(flash_arg, bool):
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {"error": "text must be a string and flash a boolean"}
+                        ),
+                    )
+                ]
+            result = service.submit(text_arg, flash=flash_arg)
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result.to_dict(), ensure_ascii=False),
+                )
+            ]
 
         if name == "speak":
             if not gw.esp32.device_connected:

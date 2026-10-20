@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Queue a proactive announcement on the AI Passport device (Stage H).
+
+Usage:
+    notify "text" [--flash]
+
+Reads STACKCHAN_NOTIFY_TOKEN (falling back to STACKCHAN_TOKEN or
+BEARER_TOKEN) and STACKCHAN_NOTIFY_PORT (default 8767), then posts to the
+gateway's loopback-only notify endpoint. Stdlib only — no dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Make the device speak a short announcement when idle."
+    )
+    parser.add_argument("text", help="announcement text (max 100 characters)")
+    parser.add_argument(
+        "--flash", action="store_true", help="also flash the on-screen notice"
+    )
+    parser.add_argument("--wait", action="store_true", help="wait for device playback outcome")
+    args = parser.parse_args()
+
+    token = (
+        os.environ.get("STACKCHAN_NOTIFY_TOKEN")
+        or os.environ.get("STACKCHAN_TOKEN")
+        or os.environ.get("BEARER_TOKEN")
+        or ""
+    )
+    if not token:
+        print(
+            "error: set STACKCHAN_NOTIFY_TOKEN (or STACKCHAN_TOKEN) first",
+            file=sys.stderr,
+        )
+        return 2
+
+    port = os.environ.get("STACKCHAN_NOTIFY_PORT", "8767")
+    payload = json.dumps({"text": args.text, "flash": args.flash}).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/notify",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            result = json.loads(response.read())
+        if args.wait:
+            deadline = time.monotonic() + 100
+            while time.monotonic() < deadline:
+                query = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/notify/{result['id']}",
+                    headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(query, timeout=10) as response:
+                    result = json.loads(response.read())
+                if result["status"] not in {"queued", "playing"}:
+                    print(json.dumps(result))
+                    return 0 if result["status"] == "done" else 1
+                time.sleep(.25)
+            print("error: job_wait_timeout", file=sys.stderr)
+            return 1
+        print(json.dumps(result))  # 202 means accepted only.
+        return 0
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(f"error: HTTP {exc.code}: {body}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(
+            f"error: cannot reach the gateway notify endpoint ({exc.reason}); "
+            "is the gateway running?",
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

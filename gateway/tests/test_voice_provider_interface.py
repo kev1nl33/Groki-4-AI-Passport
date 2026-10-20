@@ -65,6 +65,7 @@ async def test_grok_shared_speak_waits_for_first_delayed_audio(monkeypatch):
         async def later():
             await asyncio.sleep(0.01)
             proxy._speak_text_frames = 1
+            await proxy.end_tts()
 
         asyncio.create_task(later())
 

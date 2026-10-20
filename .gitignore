@@ -2,3 +2,6 @@
 /.claude/
 /.idea/
 /.vscode/
+
+# Host test bytecode
+**/__pycache__/

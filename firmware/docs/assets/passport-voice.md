@@ -101,6 +101,31 @@ Test first boot and WPA2 AP access; correct, wrong, and unavailable STA credenti
 - Retain only bounded counters, heap/largest-block and task stack diagnostics; no credentials or private transcripts in added logs. No UI beautification, dependency installation, flashing, commits, pushes, or restarting the active gateway during implementation.
 - Validate manual/automatic turn boundaries, empty/short/duplicate stops, volume compatibility/persistence, retry and backend recovery, and a new utterance after playback. Run static/firmware/archive gates and gateway tests, then independent review before device testing.
 
+## Stage G diagnostic repair (implemented, device validation pending)
+
+The owner reads the previous abnormal restart record before writing this boot's
+abnormal reason to the separate NVS `diag` key. Reading or hiding never consumes
+that record: each boot continues to display the last stored abnormal record
+until a key hides it for the current boot (setup keeps its provisioning details).
+A diagnostic write failure leaves saved network configuration and volume usable.
+The voltage is sampled during the boot that writes the record, not at the instant
+of the crash.
+
+Diagnostics occupy exactly two short lines in the 204 × 34 detail area, for
+example `Restart: interrupt WDT` and `Boot battery: 3310 mV`, or
+`Boot battery: unknown` when unavailable. The first key refreshes only details
+under the LVGL lock before any key-action early return; existing status, hints,
+and key actions retain their behavior. Host doubles exercise the actual key and
+boot code, read-before-write ordering, subsequent reads, and open/set/commit
+failures. A layout test uses the installed Montserrat 14 advances and kerning for
+all uint16_t reason values and voltage boundaries; without existing Managed
+Components this font check is explicitly skipped.
+
+Device validation remains pending: confirm both diagnostic lines are fully
+visible, the first key restores details even on ignored/release paths without
+changing status or hints, setup remains readable, and history survives ordinary
+restarts while configuration still loads. No device was flashed for this repair.
+
 ## Stage F (implemented, device-verified 2026-10-19)
 
 A state-driven avatar drawn from five plain LVGL objects (two eyes, two
@@ -138,3 +163,51 @@ clients, but the firmware ignores that type today.
    and confirm the avatar returns.
 6. Compare the boot `heap=`/`largest=` log with Stage E (121348/110592) and
    confirm the drop stays small.
+
+## Stage H (implemented 2026-10-20, device tests pending)
+
+Proactive announcements: a loopback-only HTTP endpoint on the gateway lets
+the computer make the device speak a short notice while it is idle. This is
+the base layer for the later reminder and quick-note stages.
+
+Gateway queues at most 3 notices of up to 100 characters, expires waiting jobs
+at 60 s (also during submission), and spaces deliveries by 2 s after device
+completion. It requires a connected cloud proxy. Scheduling no longer reads
+DebugStatus timestamps or assumes that a reply finishes after 10 s.
+
+Each `notify.start` carries a positive `id` and `flash` flag. The device owner
+returns `notify_ack` with the same ID and `busy` or `granted`. It grants only
+outside setup, recording, pending replies and playback, after 1.5 s idle.
+No announcement text is sent to firmware. TTS start/stop carry the lease ID;
+stale segments are rejected. `tts.stop` only starts draining. Device PLAY_DONE
+returns `done` and clears the amber `Notice...` marker; cloud completion alone
+does neither. OK cancels both preparation and playback. The optional status
+blink lasts about 2.5 s and always restores visibility, including setup.
+
+The entire granted job is limited to 30 s on both sides. Cancellation stops the
+real cloud response and paced frames. A response created after cancellation is
+suppressed by ID; an unacknowledged response creation retires the cloud session
+and uses the existing session-error recovery path rather than occupying the
+next conversation. Voice errors and disconnects clear the device lease.
+
+`POST /notify` remains bearer-authenticated and bound only to `127.0.0.1`
+(default port 8767). HTTP 202 / `queued` means acceptance only. Authenticated
+`GET /notify/{id}` returns `queued`, `playing`, `done`, `cancelled`, `expired`
+or `failed`; the latest 128 metadata records are retained in memory, without
+text. `gateway/tools/notify "Task finished" --flash --wait` waits for the
+outcome and exits nonzero on failure. Local stdio MCP `notify` uses the same
+queue. LAN WS `gemini_say` is rejected; Opus `say`/`speak` refuse PCM devices.
+Errors log fixed codes or exception types, never announcement/error contents.
+
+### Stage H device acceptance (not yet run)
+
+1. With the device idle, run `gateway/tools/notify "Task finished" --flash`:
+   the notice plays, the screen shows `Notice...` (amber, blinking), then
+   returns to Ready.
+2. Notify while holding OK or during a reply: it waits and plays after the
+   conversation; an expired item (60 s) is dropped.
+3. Notify with the device off or the voice session down: the CLI reports a
+   clear HTTP 503 error, not silent success.
+4. OK during a notice: stops it immediately with no leftover `Notice...`.
+5. 120-character text is rejected with 413; five rapid notifies fill the
+   3-slot queue and the rest get 429.

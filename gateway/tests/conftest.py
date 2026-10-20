@@ -49,3 +49,23 @@ def _reset_debug_status():
     reset_debug_status()
     yield
     reset_debug_status()
+
+
+@pytest.fixture(autouse=True)
+def _optional_genai_types(request, monkeypatch):
+    # Voice transport unit tests do not require the optional cloud SDK.
+    if request.module.__name__.endswith("test_gemini_voice_proxy"):
+        import sys
+        from types import ModuleType
+        try:
+            from google.genai import types
+        except ImportError:
+            google = ModuleType("google")
+            genai = ModuleType("google.genai")
+            types = ModuleType("google.genai.types")
+            for name in ("ActivityStart", "ActivityEnd", "Blob"):
+                setattr(types, name, type(name, (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}))
+            genai.types = types
+            google.genai = genai
+            for name, module in (("google", google), ("google.genai", genai), ("google.genai.types", types)):
+                monkeypatch.setitem(sys.modules, name, module)

@@ -195,6 +195,16 @@ async def synthesize_and_send(
     # fast with a clear, actionable error instead. BinaryProtocol
     # header wrapping is tracked as a follow-up to Issue #70.
     connection = getattr(gateway.esp32, "connection", None)
+    # Stage H guard: this pipeline emits Opus frames. A device that
+    # negotiated raw PCM downlink (Stage C+) would decode them as PCM
+    # and play noise, so fail fast with an actionable error instead.
+    proxy = getattr(connection, "cloud_proxy", None)
+    if getattr(proxy, "device_pcm_downlink", False):
+        raise RuntimeError(
+            "say() synthesises Opus frames, but this device negotiated "
+            "raw PCM downlink; sending them would play noise. Use the "
+            "notify endpoint or gemini_say instead."
+        )
     proto_version = getattr(connection, "protocol_version", 1)
     if proto_version != 1:
         raise RuntimeError(

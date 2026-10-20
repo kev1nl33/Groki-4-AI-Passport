@@ -188,6 +188,47 @@ static void test_tts_state(void)
     assert(pv_parse_tts_state(big, PV_WS_MAX_MESSAGE + 1, &state) == PV_TTS_MALFORMED);
 }
 
+static void test_notify_state(void)
+{
+    pv_notify_state_t state = PV_NOTIFY_NONE;
+    bool flash = true;
+    const char *start = "{\"type\":\"notify\",\"state\":\"start\",\"flash\":true}";
+    assert(pv_parse_notify(start, strlen(start), &state, &flash) == PV_NOTIFY_OK);
+    assert(state == PV_NOTIFY_START && flash);
+    /* Absent "flash" always yields false, whatever the input value was. */
+    flash = true;
+    const char *nof = "{\"type\":\"notify\",\"state\":\"start\"}";
+    assert(pv_parse_notify(nof, strlen(nof), &state, &flash) == PV_NOTIFY_OK);
+    assert(state == PV_NOTIFY_START && !flash);
+    const char *stop = "{ \"state\" : \"stop\" , \"type\" : \"notify\" }";
+    flash = true;
+    assert(pv_parse_notify(stop, strlen(stop), &state, &flash) == PV_NOTIFY_OK);
+    assert(state == PV_NOTIFY_STOP && !flash);
+
+    const char *other = "{\"type\":\"tts\",\"state\":\"start\"}";
+    assert(pv_parse_notify(other, strlen(other), &state, &flash) == PV_NOTIFY_UNSUPPORTED);
+
+    const char *bad[] = {
+        "",
+        "[]",
+        "{\"type\":\"notify\",\"type\":\"notify\",\"state\":\"start\"}",
+        "{\"type\":\"notify\",\"state\":\"start\",}",
+        "{\"type\":\"notify\",\"state\":\"start\" \"flash\":true}",
+        "{\"type\":\"notify\",\"state\":\"start\",\"flash\":true,\"flash\":false}",
+        "{\"type\":\"notify\"}",
+        "{\"type\":\"notify\",\"state\":\"paused\"}",
+        "{\"type\":\"notify\",\"state\":\"start\",\"flash\":\"yes\"}",
+        "{\"type\":\"notify\",\"state\":\"start\",\"flash\":True}",
+        "{\"type\":\"notify\",\"state\":\"start\"",
+        "{\"type\":\"notify\",\"state\":\"start\"} trailing",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
+        assert(pv_parse_notify(bad[i], strlen(bad[i]), &state, &flash) == PV_NOTIFY_MALFORMED);
+    char big[PV_WS_MAX_MESSAGE + 2];
+    memset(big, ' ', sizeof(big));
+    assert(pv_parse_notify(big, PV_WS_MAX_MESSAGE + 1, &state, &flash) == PV_NOTIFY_MALFORMED);
+}
+
 static void test_text_classification(void)
 {
     pv_server_hello_t h;
@@ -199,6 +240,14 @@ static void test_text_classification(void)
     assert(pv_ws_classify_text(start, strlen(start), &h) == PV_TEXT_TTS_START);
     assert(pv_ws_classify_text(sentence, strlen(sentence), &h) == PV_TEXT_IGNORE);
     assert(pv_ws_classify_text(stop, strlen(stop), &h) == PV_TEXT_TTS_STOP);
+
+    /* Stage H notify bracket classifies both states; malformed is ignored. */
+    const char *nstart = "{\"type\":\"notify\",\"state\":\"start\",\"flash\":true}";
+    const char *nstop = "{\"type\":\"notify\",\"state\":\"stop\"}";
+    const char *nbad = "{\"type\":\"notify\",\"state\":\"paused\"}";
+    assert(pv_ws_classify_text(nstart, strlen(nstart), &h) == PV_TEXT_NOTIFY_START);
+    assert(pv_ws_classify_text(nstop, strlen(nstop), &h) == PV_TEXT_NOTIFY_STOP);
+    assert(pv_ws_classify_text(nbad, strlen(nbad), &h) == PV_TEXT_IGNORE);
 
     const char *mcp =
         "{\"type\":\"mcp\",\"payload\":{\"text\":\"a\\\"b\\\\c\\n\\u4F60\"}}";
@@ -350,6 +399,7 @@ int main(void)
     test_parse_hello();
     test_server_audio_params();
     test_tts_state();
+    test_notify_state();
     test_text_classification();
     test_transport_event_classification();
     test_backoff();

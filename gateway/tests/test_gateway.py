@@ -82,6 +82,46 @@ async def test_gateway_start_stop(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gateway_notify_endpoint_binds_loopback_only(monkeypatch):
+    """Stage H: with a token the notify endpoint binds 127.0.0.1 only."""
+    monkeypatch.setenv("WS_PORT", "0")
+    monkeypatch.setenv("CAPTURE_PORT", "0")
+    monkeypatch.setenv("STACKCHAN_NOTIFY_TOKEN", "notify-token")
+    monkeypatch.setenv("STACKCHAN_NOTIFY_PORT", "0")  # Random port
+
+    gw = Gateway()
+    await gw.start()
+    try:
+        assert gw.notify_service is not None
+        assert gw._notify_task is not None
+        assert gw._notify_runner is not None
+        addresses = gw._notify_runner.addresses
+        assert addresses, "notify runner has no bound site"
+        assert all(host == "127.0.0.1" for host, _port in addresses)
+    finally:
+        await gw.stop()
+    assert gw._notify_runner is None
+    assert gw._notify_task is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_notify_endpoint_disabled_without_token(monkeypatch):
+    """Stage H: no token anywhere means the notify endpoint never starts."""
+    monkeypatch.setenv("WS_PORT", "0")
+    monkeypatch.setenv("CAPTURE_PORT", "0")
+    for var in ("STACKCHAN_NOTIFY_TOKEN", "STACKCHAN_TOKEN", "BEARER_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+
+    gw = Gateway()
+    await gw.start()
+    try:
+        assert gw.notify_service is None
+        assert gw._notify_runner is None
+    finally:
+        await gw.stop()
+
+
+@pytest.mark.asyncio
 async def test_track_endpoint_forwards_to_tracking_bridge():
     """POST /track on the capture server reaches TrackingBridge.handle_detection.
 
@@ -902,8 +942,8 @@ async def test_gemini_say_routes_to_active_proxy_speak_text():
 
     result = await gw._handle_external_local_tool("gemini_say", {"text": "搞定了"})
 
-    assert result["ok"] is True
-    assert calls["args"] == ("搞定了", "hook-notify", [], None)
+    assert result == {"ok": False, "error": "use_authenticated_loopback_notify"}
+    assert calls == {}
 
 
 @pytest.mark.asyncio
@@ -916,7 +956,7 @@ async def test_gemini_say_without_session_returns_error():
     result = await gw._handle_external_local_tool("gemini_say", {"text": "hi"})
 
     assert result["ok"] is False
-    assert "no active gemini" in result["error"]
+    assert result["error"] == "use_authenticated_loopback_notify"
 
 
 @pytest.mark.asyncio

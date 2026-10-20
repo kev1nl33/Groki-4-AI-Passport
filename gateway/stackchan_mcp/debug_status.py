@@ -122,6 +122,9 @@ class DebugStatus:
     # ---- audio ----
     last_device_audio_at: float | None = None
     tts_active: bool = False
+    device_listen_open: bool = False
+    last_listen_stop_at: float | None = None
+    last_tts_end_at: float | None = None
     _tts_sources: set[str] = field(default_factory=set, repr=False)
 
     # ---- face tracking ----
@@ -145,6 +148,8 @@ class DebugStatus:
 
     def on_device_disconnected(self) -> None:
         self.device_connected_flag = False
+        self.device_listen_open = False
+        self.tts_active = False
         self.device_connected_since = None
         self.device_last_disconnect_at = self.clock()
         self.device_disconnect_count += 1
@@ -281,6 +286,14 @@ class DebugStatus:
     def on_device_audio(self) -> None:
         self.last_device_audio_at = self.clock()
 
+    def on_device_listen(self, opened: bool) -> None:
+        """Track the device's hold-to-talk listen window (Stage H)."""
+        if opened:
+            self.device_listen_open = True
+        else:
+            self.device_listen_open = False
+            self.last_listen_stop_at = self.clock()
+
     def on_tts_state(self, active: bool, *, source: str = "gemini") -> None:
         """Merge independent speakers so one backend cannot clear another's TTS."""
         if active:
@@ -288,6 +301,8 @@ class DebugStatus:
         else:
             self._tts_sources.discard(source)
         self.tts_active = bool(self._tts_sources)
+        if not self.tts_active:
+            self.last_tts_end_at = self.clock()
 
     # ---- recent events ----
 
@@ -349,6 +364,9 @@ class DebugStatus:
             "audio": {
                 "last_device_audio_at": self.last_device_audio_at,
                 "tts_active": self.tts_active,
+                "device_listen_open": self.device_listen_open,
+                "last_listen_stop_at": self.last_listen_stop_at,
+                "last_tts_end_at": self.last_tts_end_at,
             },
             "face_tracking": (
                 self.face_tracking_provider() if self.face_tracking_provider is not None else None

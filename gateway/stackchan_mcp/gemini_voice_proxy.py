@@ -825,6 +825,11 @@ class GeminiVoiceProxy:
 
     # ---- egress to device ---------------------------------------------------
 
+    @property
+    def device_pcm_downlink(self) -> bool:
+        """Whether the connected device negotiated raw PCM downlink (Stage C+)."""
+        return bool(self._device_pcm_downlink)
+
     async def speak_text(
         self,
         text: str,
@@ -874,6 +879,11 @@ class GeminiVoiceProxy:
             "Do not add anything and do not call tools:\n"
             + text
         )
+        if self._speak_text_active:
+            return {"ok": False, "error": "speech_busy"}
+        self._announcement_id = int(session_id[7:]) if session_id.startswith("notify-") else 0
+        self._speech_done = asyncio.Event()
+        self._speech_cancelled = False
         self._speak_text_active = True
         self._speak_text_frames = 0
         try:
@@ -889,32 +899,36 @@ class GeminiVoiceProxy:
                 "error": f"gemini send failed: {exc}",
             }
 
-        # The receive loop in GeminiLiveBridge will drive our on_audio
-        # callback which writes the Opus frames to the device. Wait for
-        # the tts.stop to flip the flag.
-        timeout = float(os.getenv("GEMINI_SPEAK_TIMEOUT_SECONDS", "30"))
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
         try:
-            while (self._tts_active or self._codec_has_data() or
-                   (self._speak_waits_for_first_audio() and self._speak_text_frames == 0)):
-                if loop.time() > deadline:
-                    break
-                await asyncio.sleep(0.05)
-        except asyncio.CancelledError:
+            await asyncio.wait_for(self._speech_done.wait(), 30)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await self.cancel_announcement(self._announcement_id)
             raise
         finally:
             self._speak_text_active = False
-
         frames_sent = self._speak_text_frames
-        return {
-            "ok": frames_sent > 0,
-            "text": text,
-            "emotion": emotion,
-            "frames_sent": frames_sent,
-            "provider": self._voice_hello()["provider"],
-            "error": None if frames_sent > 0 else "no audio frames delivered",
-        }
+        return {"ok": frames_sent > 0 and not self._speech_cancelled,
+                "frames_sent": frames_sent,
+                "error": "cancelled" if self._speech_cancelled else None}
+
+    async def cancel_announcement(self, item_id: int) -> None:
+        if item_id != getattr(self, "_announcement_id", 0):
+            return
+        self._speech_cancelled = True
+        interrupt = getattr(self._bridge, "cancel_announcement", None) or getattr(self._bridge, "interrupt", None)
+        if callable(interrupt):
+            await interrupt()
+        else:
+            await self._abort_in_flight_tts()
+        done = getattr(self, "_speech_done", None)
+        if done is not None:
+            done.set()
+
+    def _tts_envelope(self, state):
+        message = {"type": "tts", "state": state}
+        if self._speak_text_active and getattr(self, "_announcement_id", 0):
+            message["id"] = self._announcement_id
+        return json.dumps(message)
 
     def _codec_has_data(self) -> bool:
         codec = self._codec
@@ -1173,7 +1187,7 @@ class GeminiVoiceProxy:
         """Emit the start envelope just before the first Opus frame."""
         assert self._send_to_device is not None
         try:
-            await self._send_to_device(json.dumps({"type": "tts", "state": "start"}))
+            await self._send_to_device(self._tts_envelope("start"))
             await self._send_to_device(
                 json.dumps({"type": "tts", "state": "sentence_start", "text": ""})
             )
@@ -1435,6 +1449,8 @@ class GeminiVoiceProxy:
 
         if not self._tts_active:
             self._clear_turn_emotion_face()
+            if self._speak_text_active:
+                self._speech_done.set()
             return
 
         # Push the codec or partial-PCM tail through the drain so it stays in
@@ -1458,7 +1474,7 @@ class GeminiVoiceProxy:
                 return
             try:
                 await self._send_to_device(  # type: ignore[misc]
-                    json.dumps({"type": "tts", "state": "stop"})
+                    self._tts_envelope("stop")
                 )
             except Exception as exc:
                 logger.warning("tts.stop envelope failed: %s", exc)
@@ -1470,6 +1486,9 @@ class GeminiVoiceProxy:
             self._signal_speaking_leds(*self._post_tts_led_rgb())
             self._clear_turn_emotion_face()
 
+        if self._speak_text_active:
+            self._speech_done.set()
+
     async def _abort_in_flight_tts(self) -> None:
         """Drop in-flight TTS and tell the device to leave Speaking state.
 
@@ -1479,6 +1498,9 @@ class GeminiVoiceProxy:
         notes this in ``audio_stream.send_tts_state``). Always pair the
         codec reset with a stop envelope so the device returns to idle.
         """
+        if self._speak_text_active:
+            self._speech_cancelled = True
+            self._speech_done.set()
         self._tts_generation += 1
         # Wake blocked producers before replacing the old frame queue.
         puts = tuple(self._pcm_put_tasks)
@@ -1505,7 +1527,7 @@ class GeminiVoiceProxy:
             try:
                 async with self._send_lock:
                     await self._send_to_device(
-                        json.dumps({"type": "tts", "state": "stop"})
+                        self._tts_envelope("stop")
                     )
             except Exception as exc:
                 logger.debug("abort tts.stop drop: %s", exc)

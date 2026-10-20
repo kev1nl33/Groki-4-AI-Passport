@@ -125,6 +125,7 @@ pv_face_state_t pv_face_state_for_status(const char *status)
     if (!strcmp(status, "Listening...")) return PV_FACE_LISTENING;
     if (!strcmp(status, "Thinking...")) return PV_FACE_THINKING;
     if (!strcmp(status, "Speaking...")) return PV_FACE_SPEAKING;
+    if (!strcmp(status, "Notice...")) return PV_FACE_SPEAKING; /* Stage H */
     if (!strcmp(status, "Retrying...")) return PV_FACE_SEARCHING;
     if (!strcmp(status, "Audio error") || !strcmp(status, "Send failed") ||
         !strcmp(status, "Voice unavailable") || !strcmp(status, "Task error") ||

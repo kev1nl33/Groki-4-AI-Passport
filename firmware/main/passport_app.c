@@ -4,6 +4,7 @@
 #include "passport_audio.h"
 #include "passport_downlink.h"
 #include "passport_face.h"
+#include "passport_diag.h"
 #include "bsp_display.h"
 #include "bsp_i2c.h"
 #include "bsp_battery.h"
@@ -17,6 +18,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -53,6 +55,9 @@ typedef struct {
     unsigned ws_client_generation; /* stale-client guard; never a raw pointer */
     audio_kind_t audio;
     pv_text_kind_t text;
+    unsigned notify_id;
+    bool notify_flash;
+    bool notify_cancel;
     pv_server_hello_t hello; /* parsed in the WS callback, not read back later */
 } app_event_t;
 /* Queue is lifetime-long: callbacks never race a deleted queue or screen. */
@@ -114,12 +119,25 @@ static bool s_down_error;                  /* owner-only UI flag */
 /* Stage F avatar: the play task publishes a peak level, the LVGL timer reads
    it. One atomic, no lock on the audio path. */
 static atomic_uchar s_mouth_level;
+/* Stage H proactive notify: gateway brackets an unsolicited announcement
+   with {"type":"notify","state":...} so the UI can flag it; the audio itself
+   still arrives through the normal tts path. UI-only state, no queue. */
+static atomic_uint s_tts_notify_id;
+static atomic_uint s_notify_id; /* owner-only lease; no text on device */
+static int64_t s_notify_deadline, s_notify_idle_at;
+static atomic_bool s_notify_active;
+static atomic_bool s_notify_flash;
+static atomic_uchar s_notify_blink; /* remaining 10 Hz blink ticks */
+#define NOTIFY_BLINK_TICKS 25u      /* ~2.5 s of status blinking */
 static pv_face_model_t s_face;
 static lv_timer_t *s_face_timer;
 static lv_obj_t *s_face_box, *s_eye_l, *s_eye_r, *s_pupil_l, *s_pupil_r, *s_mouth;
 static pv_model_t s_model;
 static pv_config_t s_saved, s_active;
 static bool s_nvs_ready, s_wifi_ready, s_wifi_started, s_sta_enabled;
+/* Last abnormal restart, loaded once and shown until the next key press. */
+static char s_diag_text[PV_DIAG_TEXT_MAX];
+static bool s_diag_shown;
 static uint8_t s_volume = 50;
 static bool s_volume_dirty;
 static int64_t s_volume_changed, s_wifi_retry_at, s_thinking_at;
@@ -169,18 +187,29 @@ static void audio_downlink_start(void);
 static void audio_downlink_stop(void);
 static void audio_downlink_finish(bool error);
 
-static void show(const char *status, const char *hint)
+/* Caller holds the LVGL lock. Refresh only details, preserving status/hint. */
+static void refresh_details(void)
 {
-    /* Battery I2C is owned by this task, never executed in LVGL callbacks. */
-    int battery = bsp_battery_soc();
-    if (!bsp_lvgl_lock(500)) return;
-    lv_label_set_text(s_status, status);
     if (s_setup) lv_label_set_text_fmt(s_details, "Join Wi-Fi\n%s\nPassword\n%s\nhttp://192.168.4.1", s_ap_name, s_ap_password);
     else if (s_ws.state == PV_WS_READY && s_ws.session_id[0])
         lv_label_set_text_fmt(s_details, "%s\nSession %.16s", s_ip_text, s_ws.session_id);
     else
         lv_label_set_text_fmt(s_details, "%s\nGateway: %s", s_ip_text,
                               s_ws.state == PV_WS_READY ? "ready" : "connecting");
+    if (s_diag_shown && !s_setup) lv_label_set_text(s_details, s_diag_text);
+}
+static void show(const char *status, const char *hint)
+{
+    /* Battery I2C is owned by this task, never executed in LVGL callbacks. */
+    int battery = bsp_battery_soc();
+    if (!bsp_lvgl_lock(500)) return;
+    lv_obj_remove_flag(s_status, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_status, status);
+    /* Stage H: the proactive notice is the one status with its own color. */
+    lv_obj_set_style_text_color(s_status,
+        !strcmp(status, "Notice...") ? lv_color_hex(0xFFB000)
+                                     : lv_color_hex(0x64DEC7), 0);
+    refresh_details();
     lv_label_set_text(s_hint,hint);
     lv_label_set_text_fmt(s_volume_label,"Volume %u",(unsigned)s_volume);
     if (battery < 0) lv_label_set_text(s_battery, "--");
@@ -207,6 +236,12 @@ static void show_online(void)
     const char *status;
     if (s_down_error) {
         show("Audio error", "Gateway must send\npcm 24k mono 20ms");
+        return;
+    }
+    /* Stage H: a proactive announcement outranks the normal Speaking line
+       so the user can tell a pushed notice from a conversation reply. */
+    if (s_ws.state == PV_WS_READY && atomic_load(&s_notify_active)) {
+        show("Notice...", "OK: stop");
         return;
     }
     if (s_ws.state == PV_WS_READY && pv_down_speaking(&s_down)) {
@@ -275,6 +310,25 @@ static void face_apply(const pv_face_out_t *out)
 static void face_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    /* Stage H flash: blink the notice status briefly, then always restore.
+       Runs before the face-box check so the status line can never stay
+       hidden across a screen change (e.g. entering setup). The WS callback
+       may clear or re-arm the counter concurrently; the CAS loop keeps the
+       decrement from racing those stores. */
+    if (s_status) {
+        unsigned char blink = atomic_load(&s_notify_blink);
+        while (blink > 0) {
+            unsigned char next = blink - 1;
+            if (atomic_compare_exchange_weak(&s_notify_blink, &blink, next))
+                break;
+        }
+        if (blink > 0) {
+            if (blink & 1u) lv_obj_add_flag(s_status, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_remove_flag(s_status, LV_OBJ_FLAG_HIDDEN);
+        } else if (lv_obj_has_flag(s_status, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_remove_flag(s_status, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
     if (!s_face_box || lv_obj_has_flag(s_face_box, LV_OBJ_FLAG_HIDDEN)) return;
     const char *text = lv_label_get_text(s_status);
     pv_face_out_t out;
@@ -496,6 +550,10 @@ static esp_err_t load_saved(void)
     if(e!=ESP_OK)return e;
     uint8_t volume = 50;
     if(nvs_get_u8(h,"volume",&volume)==ESP_OK && volume<=100)s_volume=volume;
+    uint16_t diag[2];
+    size_t diag_n=sizeof(diag);
+    if(nvs_get_blob(h,"diag",diag,&diag_n)==ESP_OK && diag_n==sizeof(diag))
+        s_diag_shown=pv_diag_format(s_diag_text,sizeof(s_diag_text),(int)diag[0],(int)diag[1]-1);
     size_t n=0;
     e=nvs_get_blob(h,"config_v1",NULL,&n);
     if(e==ESP_ERR_NVS_NOT_FOUND){nvs_close(h);return ESP_OK;} /* nothing stored yet */
@@ -717,6 +775,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if(kind==PV_TEXT_VOICE_ERROR)atomic_store(&s_voice_available,false);
         if(kind==PV_TEXT_TTS_START && !atomic_load(&s_voice_available))return;
         if (kind == PV_TEXT_TTS_START || kind == PV_TEXT_TTS_STOP) {
+            unsigned id = pv_ws_request_id(s_ws_rx, total);
+            if (id && id != atomic_load(&s_notify_id)) return;
+            atomic_store(&s_tts_notify_id,id);
             bool start = kind == PV_TEXT_TTS_START;
             pv_audio_note_pending(&s_pending, start ? PV_AUDIO_PENDING_TTS_START
                                                     : PV_AUDIO_PENDING_TTS_STOP);
@@ -727,6 +788,17 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 xSemaphoreGive(s_down_acc_lock);
             }
         }
+        if (kind == PV_TEXT_NOTIFY_START || kind == PV_TEXT_NOTIFY_STOP) {
+            pv_notify_state_t ns;
+            if (pv_parse_notify(s_ws_rx, total, &ns, &e.notify_flash) != PV_NOTIFY_OK) return;
+            e.notify_id = pv_ws_request_id(s_ws_rx, total);
+            e.notify_cancel = ns == PV_NOTIFY_CANCEL;
+            if (!e.notify_id) return;
+        }
+        /* A notification's TTS must match the owner lease. Ordinary replies
+           have no id; the owner still decides their state transitions. */
+        if (kind == PV_TEXT_TTS_START || kind == PV_TEXT_TTS_STOP)
+            e.notify_id = pv_ws_request_id(s_ws_rx, total);
         if(kind==PV_TEXT_VOICE_READY || kind==PV_TEXT_VOICE_ERROR || kind==PV_TEXT_INPUT_SHORT)
             atomic_store(&s_voice_notice,kind);
         e.kind = EV_TEXT;
@@ -1087,8 +1159,27 @@ static void audio_uplink_idle(void)
 }
 
 /* Owner-side downlink transitions. The playback task only moves bytes. */
+static void notify_ack(unsigned id, const char *state)
+{
+    char message[96];
+    int n = snprintf(message, sizeof(message),
+                     "{\"type\":\"notify_ack\",\"id\":%u,\"state\":\"%s\"}", id, state);
+    if (id && n > 0 && n < (int)sizeof(message))
+        (void)ws_send_text_locked(message, (size_t)n);
+}
+
+static void notify_clear(const char *outcome)
+{
+    unsigned id = atomic_exchange(&s_notify_id, 0);
+    s_notify_deadline = 0;
+    atomic_store(&s_notify_active, false);
+    atomic_store(&s_notify_blink, 0);
+    if (id && outcome) notify_ack(id, outcome);
+}
+
 static void audio_downlink_reset(bool error)
 {
+    notify_clear(NULL);
     s_wait_reply=false;s_thinking_at=0;
     (void)pv_down_event(&s_down, error ? PV_DOWN_EV_ERROR : PV_DOWN_EV_LOST);
     audio_downlink_clear();
@@ -1105,13 +1196,17 @@ static void audio_downlink_finish(bool error)
     if (atomic_exchange(&s_down_format_24k, false) && !audio_set_format_locked(16000))
         error = true;
     audio_uplink_idle();
+    s_notify_idle_at=esp_timer_get_time();
     s_down_error = error;
     (void)action; /* STOP_AUDIO or RESET: the format switch above is the work */
+    notify_clear(error ? "failed" : "done");
     show_online();
 }
 
 static void audio_downlink_start(void)
 {
+    unsigned id=atomic_load(&s_tts_notify_id);
+    if(id && id!=atomic_load(&s_notify_id))return;
     s_wait_reply=false;s_thinking_at=0;
     if (s_ws.state != PV_WS_READY || s_backend!=1 || !atomic_load(&s_down_audio_ok)) return;
     if (!audio_ensure_ready()) {
@@ -1164,7 +1259,7 @@ static void audio_downlink_stop(void)
    in-flight response so its tail cannot leak into the next turn. */
 static void audio_playback_cancel(void)
 {
-    if (s_down.state != PV_DOWN_SPEAKING && s_down.state != PV_DOWN_DRAINING) return;
+    if (!atomic_load(&s_notify_id) && s_down.state != PV_DOWN_SPEAKING && s_down.state != PV_DOWN_DRAINING) return;
     (void)pv_down_event(&s_down, PV_DOWN_EV_LOST);
     audio_downlink_clear();
     if (atomic_exchange(&s_down_format_24k, false))
@@ -1174,6 +1269,7 @@ static void audio_playback_cancel(void)
         static const char abort_msg[] = "{\"type\":\"abort\"}";
         (void)ws_send_text_locked(abort_msg, sizeof(abort_msg) - 1);
     }
+    notify_clear("cancelled");
     show_online();
 }
 
@@ -1253,6 +1349,7 @@ static void process(const app_event_t *e)
         if(e->text==PV_TEXT_VOICE_READY){s_backend=1;s_backend_at=0;show_online();return;}
         if(e->text==PV_TEXT_VOICE_ERROR){
             audio_runtime_reset();audio_downlink_reset(true);audio_uplink_idle();
+            atomic_store(&s_notify_active,false);atomic_store(&s_notify_blink,0);
             s_down_error=false;s_backend=2;s_thinking_at=0;show_online();return;
         }
         if(e->text==PV_TEXT_INPUT_SHORT){
@@ -1287,7 +1384,26 @@ static void process(const app_event_t *e)
             }
             return;
         }
-        if(e->text==PV_TEXT_TTS_START){
+        if(e->text==PV_TEXT_NOTIFY_START || e->text==PV_TEXT_NOTIFY_STOP){
+            if(e->text==PV_TEXT_NOTIFY_START){
+                bool idle = !s_setup && s_ws.state==PV_WS_READY && s_backend==1 &&
+                    s_audio.state==PV_AUDIO_IDLE && !s_wait_reply &&
+                    pv_down_can_listen(&s_down) && atomic_load(&s_stop_sent) &&
+                    !atomic_load(&s_notify_id) && now-s_last_input>=1500000 &&
+                    now-s_notify_idle_at>=1500000;
+                if(!idle){notify_ack(e->notify_id,"busy");return;}
+                atomic_store(&s_notify_id,e->notify_id);
+                s_notify_deadline=now+30000000;
+                atomic_store(&s_notify_active,true);
+                atomic_store(&s_notify_flash,e->notify_flash);
+                atomic_store(&s_notify_blink,e->notify_flash ? NOTIFY_BLINK_TICKS : 0);
+                notify_ack(e->notify_id,"granted");
+            }else if(e->notify_id==atomic_load(&s_notify_id) && e->notify_cancel){
+                audio_playback_cancel();
+            }
+            /* stop is only cloud completion; PLAY_DONE owns UI/completion. */
+            show_online();
+        } else if(e->text==PV_TEXT_TTS_START){
             if(pv_audio_take_pending(&s_pending,PV_AUDIO_PENDING_TTS_START))
                 audio_downlink_start();
         } else if(e->text==PV_TEXT_TTS_STOP){
@@ -1319,6 +1435,11 @@ static void process(const app_event_t *e)
     }
     if(e->kind==EV_KEY){
         s_last_input=esp_timer_get_time();bsp_display_backlight(70);
+        if(s_diag_shown && bsp_lvgl_lock(500)){
+            s_diag_shown=false;
+            refresh_details();
+            bsp_lvgl_unlock();
+        }
         if(e->key==BSP_BTN_UP && e->key_event==BSP_BTN_PRESS)s_up_long=false;
         if(e->key==BSP_BTN_UP && e->key_event==BSP_BTN_LONG)s_up_long=true;
         if((e->key==BSP_BTN_UP || e->key==BSP_BTN_DOWN) && e->key_event==BSP_BTN_CLICK){
@@ -1331,7 +1452,7 @@ static void process(const app_event_t *e)
             show_online();return;
         }
         if(e->key==BSP_BTN_OK && e->key_event==BSP_BTN_PRESS){
-            if(s_down.state==PV_DOWN_SPEAKING || s_down.state==PV_DOWN_DRAINING){
+            if(atomic_load(&s_notify_id) || s_down.state==PV_DOWN_SPEAKING || s_down.state==PV_DOWN_DRAINING){
                 audio_playback_cancel();return;
             }
             if(s_ws.state!=PV_WS_READY || s_backend!=1){
@@ -1405,6 +1526,20 @@ static void owner(void *arg)
     if(bsp_battery_init()!=ESP_OK)ESP_LOGW(TAG,"battery unavailable; showing --");
     esp_err_t storage=load_saved();
     if(storage!=ESP_OK){show("Storage error","NVS kept intact\nRestart to retry");vTaskDelete(NULL);return;}
+    /* Record an abnormal restart once storage is readable. This is a boot-time
+       voltage, not a crash-time sample. The voltage is
+       biased by one so a failed reading (stored as 0) stays distinct from a
+       real 0 mV. A crash before this point is not recorded. */
+    {
+        int reason=(int)esp_reset_reason();
+        if(pv_diag_abnormal(reason)){
+            int mv=bsp_battery_mv();
+            uint16_t diag[2]={(uint16_t)reason,(uint16_t)(mv<0?0:mv+1)};
+            nvs_handle_t h;esp_err_t e=nvs_open("passport",NVS_READWRITE,&h);
+            if(e==ESP_OK){e=nvs_set_blob(h,"diag",diag,sizeof(diag));if(e==ESP_OK)e=nvs_commit(h);nvs_close(h);}
+            if(e!=ESP_OK)ESP_LOGW(TAG,"diag save failed: %s",esp_err_to_name(e));
+        }
+    }
     if(network_init()!=ESP_OK){show("Network error","Restart to retry");vTaskDelete(NULL);return;}
     ESP_LOGI(TAG,"Stage A heap=%u largest=%u",(unsigned)esp_get_free_heap_size(),(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     if(s_model.has_saved)request_attempt(&s_saved,false);
@@ -1422,6 +1557,7 @@ static void owner(void *arg)
                replaced; its event may have been dropped from a full queue. */
             if(atomic_load(&s_pending_ws_generation)==atomic_load(&s_ws_client_generation)){
                 audio_ws_lost();ws_destroy();
+                atomic_store(&s_notify_active,false);atomic_store(&s_notify_blink,0);
                 pv_ws_event(&s_ws,PV_EV_TRANSPORT_CLOSED,s_ws.generation,esp_timer_get_time());
                 show_online();
             }
@@ -1431,6 +1567,7 @@ static void owner(void *arg)
         if(pv_audio_take_pending(&s_pending,PV_AUDIO_PENDING_STOP_SENT))audio_stop_complete();
         if(pv_audio_take_pending(&s_pending,PV_AUDIO_PENDING_TTS_START))audio_downlink_start();
         if(pv_audio_take_pending(&s_pending,PV_AUDIO_PENDING_TTS_STOP))audio_downlink_stop();
+        if(pv_audio_take_pending(&s_pending,PV_AUDIO_PENDING_NOTIFY))show_online();
         if(pv_audio_take_pending(&s_pending,PV_AUDIO_PENDING_PLAY_FAILED))audio_downlink_finish(true);
         if(pv_audio_take_pending(&s_pending,PV_AUDIO_PENDING_PLAY_DONE))audio_downlink_finish(false);
         if(pv_audio_take_pending(&s_pending,PV_AUDIO_PENDING_RELEASE))audio_release();
@@ -1442,12 +1579,14 @@ static void owner(void *arg)
         int notice=atomic_load(&s_voice_notice);
         if(notice){app_event_t voice={.kind=EV_TEXT,.text=(pv_text_kind_t)notice,.ws_client_generation=atomic_load(&s_ws_client_generation)};process(&voice);}
         int64_t now=esp_timer_get_time();
+        if(s_notify_deadline && now>=s_notify_deadline)audio_playback_cancel();
         if(s_ws.state==PV_WS_READY && s_backend==0 && s_backend_at && now-s_backend_at>15000000){s_backend=2;show_online();}
         if(now-s_diag_at>=60000000){
             s_diag_at=now;
             ESP_LOGI(TAG,"health heap=%u largest=%u owner_stack=%u up_drop=%u down_drop=%u",(unsigned)esp_get_free_heap_size(),(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),(unsigned)uxTaskGetStackHighWaterMark(NULL),(unsigned)atomic_load(&s_audio_dropped),(unsigned)atomic_load(&s_down_dropped));
         }
         bool audio_busy=s_audio.state==PV_AUDIO_LISTENING || s_audio.state==PV_AUDIO_THINKING || s_wait_reply || pv_down_speaking(&s_down);
+        if(audio_busy)s_notify_idle_at=now;
         if(pv_volume_save_due(s_volume_dirty,audio_busy,now/1000,s_volume_changed)){
             nvs_handle_t h;esp_err_t e=nvs_open("passport",NVS_READWRITE,&h);
             if(e==ESP_OK){e=nvs_set_u8(h,"volume",s_volume);if(e==ESP_OK)e=nvs_commit(h);nvs_close(h);}

@@ -36,6 +36,18 @@ Grok voice → localhost:18771 login helper → native Grok Bot
 Gemini ask_grokbot → optional localhost:18770 → gbot CLI → Grok Bot
 ```
 
+## Desktop reconnection
+
+Voice audio and native desktop readiness are separate. A healthy `/health` only
+checks the helper; `/native/health` checks the desktop sandbox handshake. The
+helper releases call ownership when its last event stream closes; a registration
+that never opens a stream expires after 30 seconds. Concurrent live calls still
+return `409 call_conflict`. Failed transport or authentication invalidates only
+the failed cached connection so the existing retry can locate it again; requests
+are never automatically replayed. These lifecycle paths have Node regressions.
+A real native read-only search returned `served` on 2026-10-20; physical voice
+acceptance of the original computer-information request remains pending.
+
 ## Do you need this?
 
 The Groki Bot firmware can already talk on its own: flash it, enter your own

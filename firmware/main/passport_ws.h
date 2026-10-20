@@ -68,6 +68,8 @@ typedef enum {
     PV_TEXT_VOICE_READY,
     PV_TEXT_VOICE_ERROR,
     PV_TEXT_INPUT_SHORT,
+    PV_TEXT_NOTIFY_START, /* Stage H proactive announce bracket (UI only) */
+    PV_TEXT_NOTIFY_STOP,
 } pv_text_kind_t;
 
 /* Classify a complete text message in the WS callback. Only hello types are
@@ -78,6 +80,23 @@ pv_text_kind_t pv_ws_classify_text(const char *message, size_t len,
 /* Bounded top-level parse for {"type":"tts","state":"..."} messages. */
 pv_tts_result_t pv_parse_tts_state(const char *message, size_t len,
                                    pv_tts_state_t *out);
+
+typedef enum {
+    PV_NOTIFY_NONE,
+    PV_NOTIFY_START,
+    PV_NOTIFY_STOP,
+    PV_NOTIFY_CANCEL,
+} pv_notify_state_t;
+
+typedef enum { PV_NOTIFY_OK, PV_NOTIFY_UNSUPPORTED, PV_NOTIFY_MALFORMED } pv_notify_result_t;
+
+/* Bounded top-level parse for {"type":"notify","state":"...","flash":bool}.
+   Stage H: brackets a proactive announcement so the UI can show a notice;
+   "flash" defaults to false when absent. */
+pv_notify_result_t pv_parse_notify(const char *message, size_t len,
+                                   pv_notify_state_t *state, bool *flash);
+/* Zero means absent/invalid. IDs bind grants, audio and completion on one WS. */
+unsigned pv_ws_request_id(const char *message, size_t len);
 
 typedef enum {
     PV_WS_IDLE,

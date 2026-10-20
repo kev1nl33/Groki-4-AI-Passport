@@ -435,7 +435,7 @@ class GbotVoiceBridge:
                     len(self._pending_updates),
                 )
             return
-        if self._response_requested:
+        if self._response_requested or getattr(self, "_cancel_pending_created", False):
             if self._pending_updates:
                 logger.info(
                     "Grok native update state=blocked reason=manual_requested pending=%d",
@@ -532,10 +532,21 @@ class GbotVoiceBridge:
         self._pending_response = False
         self._cancel_idle()
 
+    async def cancel_announcement(self):
+        await self.interrupt()
+        if getattr(self, "_cancel_pending_created", False):
+            # Without a server response ID, cancellation cannot be confirmed.
+            # Retire this cloud session rather than let an old create own the
+            # next user turn. The existing session-dead recovery UI applies.
+            if self._ws is not None:
+                await self._ws.close()
+
     async def inject_user_text(self, text):
         # Programmatic speech/notices do not grant desktop dispatch authority.
         if self._stopped:
             return False
+        if getattr(self, "_cancel_pending_created", False):
+            raise RuntimeError("response_cancellation_pending")
         await self._send(
             {
                 "type": "conversation.item.create",
@@ -699,7 +710,7 @@ class GbotVoiceBridge:
     async def begin_manual_turn(self):
         if not self._manual_turn_mode or self._manual_open:
             return
-        if self._response_in_progress or self._response_requested or self._output.busy:
+        if self._response_in_progress or self._response_requested or self._output.busy or getattr(self, "_cancel_pending_created", False):
             return
         self._manual_generation += 1
         self._manual_bytes = 0
@@ -740,6 +751,10 @@ class GbotVoiceBridge:
             await self._send({"type": "input_audio_buffer.clear"})
             return False
         await self._send({"type": "input_audio_buffer.commit"})
+        # Manual clients suppress VAD events, so a successfully committed real
+        # recording is their user-authority boundary. Short/failed/cancelled
+        # recordings and internal speech must not grant desktop delegation.
+        self._user_epoch += 1
         # Same ordered WS: create follows commit; committed notifications do
         # not create responses, so late/duplicate acknowledgements are harmless.
         await self._request_response()
@@ -764,6 +779,9 @@ class GbotVoiceBridge:
 
     async def interrupt(self):
         self._cancel_idle()
+        self._manual_open = False
+        self._manual_bytes = 0
+        self._user_speaking = False
         self._pending_response = False
         active = self._response_in_progress or bool(
             self._turn_task and not self._turn_task.done()
@@ -776,7 +794,8 @@ class GbotVoiceBridge:
         await self._on_interrupt()
         if active:
             self.metrics["interruptions"] += 1
-        if self._response_in_progress:
+        if self._response_in_progress or self._response_requested:
+            self._cancel_pending_created = self._response_requested and not self._response_in_progress
             self._response_in_progress = False
             self._response_requested = False
             await self._send({"type": "response.cancel"})
@@ -788,6 +807,12 @@ class GbotVoiceBridge:
         if kind == "session.updated":
             self._connected_event.set()
         elif kind == "response.created":
+            if getattr(self, "_cancel_pending_created", False):
+                self._cancel_pending_created = False
+                response_id = event.get("response", {}).get("id")
+                self._suppressed.add(response_id)
+                await self._send({"type": "response.cancel"})
+                return
             self._active_response = event.get("response", {}).get("id")
             self._response_in_progress = True
             self._response_requested = False

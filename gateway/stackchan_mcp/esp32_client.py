@@ -325,6 +325,23 @@ class ESP32Connection:
         }
         await self._ws_send(json.dumps(message))
 
+    async def send_notify_state(self, state: str, *, flash: bool = False) -> None:
+        """Send a Stage H notify bracket around a proactive announcement.
+
+        ``{"type":"notify","state":"start"}`` lets the firmware show a
+        distinct notice instead of the normal Speaking status while the
+        announcement plays; ``stop`` clears it. Unknown to the firmware is
+        safe: unsolicited messages are ignored.
+        """
+        if not self._connected:
+            raise ConnectionError("ESP32 not connected")
+        message = {
+            "type": "notify",
+            "state": state,
+            "flash": bool(flash),
+        }
+        await self._ws_send(json.dumps(message))
+
     def disconnect(self) -> None:
         """Mark connection as disconnected."""
         self._connected = False
@@ -920,10 +937,28 @@ class ESP32Manager:
             if state == "stop" and self._connection is connection:
                 self._debug_status.on_tts_state(False, source="local")
 
+    async def send_notify_state(self, state: str, *, flash: bool = False) -> None:
+        """Send a Stage H notify bracket to the connected device."""
+        connection = self._connection
+        if not connection or not connection.connected:
+            raise ConnectionError("No ESP32 device connected")
+        await connection.send_notify_state(state, flash=flash)
+
     async def speak(self, text: str, emotion: str | None = None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Speak through the connected ESP32 device."""
         if not self._connection or not self._connection.connected:
             return None, {"code": -32000, "message": "No ESP32 device connected"}
+        # Stage H guard: this pipeline streams Opus frames, which a device
+        # that negotiated raw PCM downlink would decode as noise.
+        proxy = getattr(self._connection, "cloud_proxy", None)
+        if getattr(proxy, "device_pcm_downlink", False):
+            return None, {
+                "code": -32000,
+                "message": (
+                    "speak() sends Opus frames, but this device negotiated "
+                    "raw PCM downlink; use the notify endpoint instead."
+                ),
+            }
         if not self._connection.initialized:
             return None, {"code": -32000, "message": "ESP32 not initialized"}
         if self.on_activity is not None:
@@ -934,16 +969,27 @@ class ESP32Manager:
         return result.to_dict(), None
 
     def _observe_device_state(self, message: dict[str, Any]) -> None:
+        connection = self.connection
+        pending = getattr(connection, "notify_replies", None)
+        if message.get("type") == "notify_ack" and pending:
+            item_id, replies = pending
+            if type(message.get("id")) is int and message["id"] == item_id:
+                state = message.get("state")
+                if state in {"granted", "busy", "done", "failed", "cancelled"}:
+                    replies.put_nowait(state)
+            return
         callback = self.on_device_state
         msg_type = message.get("type", "")
         state = str(message.get("state", "")).lower()
         if msg_type == "listen":
             if state in {"start", "detect"}:
+                self._debug_status.on_device_listen(True)
                 if callback is not None:
                     callback("listening")
                 if state == "detect" and self.on_wake_detected is not None:
                     asyncio.create_task(self.on_wake_detected())
             elif state == "stop":
+                self._debug_status.on_device_listen(False)
                 if callback is not None:
                     callback("idle")
         elif msg_type == "tts":

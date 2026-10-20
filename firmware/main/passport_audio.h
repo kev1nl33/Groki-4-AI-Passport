@@ -61,5 +61,6 @@ bool pv_audio_queue_frame(pv_audio_stats_t *stats, bool accepted);
 #define PV_AUDIO_PENDING_TTS_STOP  (1u << 4)
 #define PV_AUDIO_PENDING_PLAY_DONE (1u << 5)
 #define PV_AUDIO_PENDING_PLAY_FAILED (1u << 6)
+#define PV_AUDIO_PENDING_NOTIFY    (1u << 7) /* Stage H notice state changed */
 void pv_audio_note_pending(atomic_uint *bits, unsigned flag);
 bool pv_audio_take_pending(atomic_uint *bits, unsigned flag);

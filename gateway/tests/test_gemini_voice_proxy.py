@@ -1458,7 +1458,13 @@ async def test_speak_text_sends_prompt_to_gemini_session(monkeypatch, info):
 
     await proxy.start(info, {"type": "hello"}, send)
 
-    # speak_text must return quickly here; fake codec leaves empty buffer.
+    # A prompt with no audio must still wait for actual cloud turn completion.
+    async def complete_later():
+        while not proxy._speak_text_active:
+            await asyncio.sleep(0)
+        await asyncio.sleep(.01)
+        await proxy.end_tts()
+    completion = asyncio.create_task(complete_later())
     proxy._tts_active = False
     result = await proxy.speak_text(
         "你好呀",
@@ -1468,7 +1474,7 @@ async def test_speak_text_sends_prompt_to_gemini_session(monkeypatch, info):
     )
     assert result["ok"] is False
     assert result["frames_sent"] == 0
-    assert result["provider"] == "gemini_live"
+    await completion
     # The bridge's fake session should have seen the prompt via realtime_input.
     bridge = proxy._bridge
     assert bridge.realtime_text_calls, "Gemini did not receive the speak prompt"

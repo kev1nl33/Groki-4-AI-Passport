@@ -59,6 +59,54 @@ test('native bootstrap uses fixed read-only request and cancels bodies without r
   assert.equal(JSON.stringify(result).includes('FAKE'),false);
 });
 
+test('native sandbox discards a failed cached connection without replaying requests', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  for (const failure of ['transport','http']) {
+    let connections=0,requests=0;
+    const client=new NativeSandboxClient({accountLoader:()=>({authId:'owner'}),rpc:async()=>({gatewayUrl:`https://pod${++connections}.cursorvm.com`,gatewayToken:'FAKE'}),fetcher:async()=>{
+      requests++;
+      if(requests===1) {
+        if(failure==='transport') throw new TypeError('fetch failed');
+        return new Response('',{status:401});
+      }
+      return new Response('',{status:200});
+    }});
+    const body={agentId:'a',callId:'c',isOnTheLine:true,acceptsOverheard:false};
+    await assert.rejects(client.presence(body));
+    assert.equal(requests,1); // Never replay a potentially committed POST.
+    await client.presence(body);
+    assert.equal(connections,2); assert.equal(requests,2);
+  }
+});
+
+test('native cache survives business errors, cancellation and a stale concurrent failure', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  for (const status of [400,404,409,422]) {
+    let connects=0;
+    const client=new NativeSandboxClient({accountLoader:()=>({}),rpc:async()=>{connects++;return {gatewayUrl:'https://pod.cursorvm.com',gatewayToken:'FAKE'};},fetcher:async()=>new Response('',{status})});
+    const body={}; await assert.rejects(client.presence(body)); await assert.rejects(client.presence(body));
+    assert.equal(connects,1);
+  }
+  let connects=0,requests=0,rejectOld;
+  const client=new NativeSandboxClient({accountLoader:()=>({}),rpc:async()=>({gatewayUrl:`https://pod${++connects}.cursorvm.com`,gatewayToken:'FAKE'}),fetcher:async()=>{
+    requests++;
+    if(requests===1) return new Promise((_,reject)=>{rejectOld=reject;});
+    if(requests===2) throw new TypeError('broken');
+    return new Response('',{status:200});
+  }});
+  const old=client.presence({});
+  while(!rejectOld) await new Promise(resolve=>setImmediate(resolve));
+  await assert.rejects(client.presence({}));
+  await client.presence({}); assert.equal(connects,2);
+  rejectOld(new TypeError('late')); await assert.rejects(old);
+  await client.presence({}); assert.equal(connects,2);
+  const controller=new AbortController();
+  client.fetcher=async()=>{controller.abort();throw new DOMException('cancelled','AbortError');};
+  await assert.rejects(client.openEvents(controller.signal));
+  client.fetcher=async()=>new Response('',{status:200});
+  await client.presence({}); assert.equal(connects,2);
+});
+
 test('native event filtering excludes history, other callers, sessions and duplicate entries', async () => {
   const {filterNativeEvent} = await import('./gbot_voice_session_bridge.mjs');
   const context = {agentId:'a',callId:'call-c',sessionId:'',authId:'owner',sinceMs:100,seen:new Set()};
@@ -125,6 +173,64 @@ test('native event IDs deduplicate replays without conflating separate same-text
   assert.ok(filterNativeEvent(event,context));
   assert.equal(filterNativeEvent(event,context),null);
   assert.ok(filterNativeEvent({...event,eventId:'event-2'},context));
+});
+
+test('HTTP: registration without an event stream expires and stale cleanup cannot unregister successor', async () => {
+  const port = await freePort();
+  const server = createBridge({port,agentId:'a',desktopEnabled:true,toolsEnabled:false,nativeRegistrationGraceMs:20,sandbox:{callerAuthId:async()=> 'owner',presence:async()=>{}}});
+  await new Promise(resolve=>server.listen(port,'127.0.0.1',resolve));
+  const post = (callId,on=true) => fetch(`http://127.0.0.1:${port}/native/presence`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agentId:'a',callId,isOnTheLine:on,acceptsOverheard:false})});
+  try {
+    assert.equal((await post('old')).status,200);
+    assert.equal((await post('new')).status,409);
+    await new Promise(resolve=>setTimeout(resolve,40));
+    assert.equal((await post('new')).status,200);
+    assert.equal((await post('old',false)).status,409);
+    assert.equal((await post('new',false)).status,200);
+  } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('HTTP: disconnected voice call releases ownership without clearing its successor', async () => {
+  const port = await freePort();
+  const releases = [];
+  const sandbox = {
+    callerAuthId: async () => 'owner', presence: async () => {},
+    openEvents: async signal => new Response(new ReadableStream({start(controller) {
+      signal.addEventListener('abort', () => controller.close(), {once:true});
+    }}), {headers:{'content-type':'text/event-stream'}}),
+  };
+  // Hold old stream cleanup after disconnect so a successor can register first.
+  const transcript = {async *events(_context, signal) {
+    await new Promise(resolve => signal.addEventListener('abort', resolve, {once:true}));
+    await new Promise(resolve => releases.push(resolve));
+  }};
+  const server = createBridge({port,agentId:'a',desktopEnabled:true,toolsEnabled:false,sandbox,transcript,nativeLog:()=>{},rpc:async()=>({kind:1,output:{ok:true}})});
+  await new Promise(resolve=>server.listen(port,'127.0.0.1',resolve));
+  const post = (callId, on=true) => fetch(`http://127.0.0.1:${port}/native/presence`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agentId:'a',callId,isOnTheLine:on,acceptsOverheard:false})});
+  const open = async callId => (await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=${callId}`)).body.getReader();
+  let old, current;
+  try {
+    assert.equal((await post('old')).status,200);
+    old=await open('old'); await old.read();
+    const conflict=await post('current');
+    assert.equal(conflict.status,409); assert.equal((await conflict.json()).error,'call_conflict');
+    await old.cancel(); old=null;
+    for(let i=0;i<50 && releases.length===0;i++) await new Promise(resolve=>setTimeout(resolve,5));
+    assert.equal(releases.length,1);
+    assert.equal((await post('current')).status,200);
+    current=await open('current'); await current.read();
+    releases.shift()();
+    await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal((await post('third')).status,409);
+    assert.equal((await post('old',false)).status,409);
+    const result=await fetch(`http://127.0.0.1:${port}/tool`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agentId:'a',callId:'current',name:'search_conversations',input:{query:'fixture'},line:{theyJustTalked:false,newsOwed:false,receiptOwed:false,alreadySpokeThisTurn:false}})});
+    assert.equal(result.status,200); assert.equal((await result.json()).output.ok,true);
+  } finally {
+    await old?.cancel(); await current?.cancel();
+    await new Promise(resolve=>setTimeout(resolve,10));
+    for(const release of releases) release();
+    server.closeAllConnections(); await new Promise(resolve=>server.close(resolve));
+  }
 });
 
 test('HTTP: typed EOF or error reconnects independently and box results still arrive', async () => {

@@ -31,6 +31,94 @@
 - **Unverified**：短按"按住说话"提示、断网自动重连、离线时 OK 立即重试、
   云端错误恢复、网关重启恢复 —— 均已实现并有单元测试覆盖，但未单独安排
   实机复测；随时可以补验。
+- **阶段 H（2026-10-20 最终候选，已保留 NVS 刷入，待用户验收）**：Build PASS；完整固件门禁
+  exit=0，独立 archive verify PASS。full.bin SHA256
+  `b8a62ad86df300ca7a553e1a1ff3cd273c7875ab06321ae5f3448e303068f36c`
+  （1,549,696 字节）；ELF SHA256
+  `78dd6be4595aa5991e8b7f8bf5cfdeb8d700d912fa22829db3f422d53ade9392`。
+  归档 `firmware/build/firmware/b8a62ad86df300ca7a553e1a1ff3cd273c7875ab06321ae5f3448e303068f36c/`。
+  网关全量 pytest **872 passed / 4 skipped，31.86 秒，exit=0**。
+  设备 owner 按 ID 授予空闲许可，PLAY_DONE 才完成通知；30 秒双侧上限；
+  OK 可取消准备/播放，LAN gemini_say 拒绝，通知 job 可查询或 CLI --wait。
+  Device tests：经用户授权，归档独立 verify PASS，新旧已验证分区表逐字节一致；
+  仅将 1,484,160 字节应用写入 `0x10000`，esptool Hash verified，实际擦写
+  `0x10000–0x17afff`，未覆盖 NVS、PHY、bootloader 或分区表。设备自动联网，
+  无需重设配网；14 秒日志未见崩溃/断言/存储错误，heap=120180/largest=110592，
+  串口已关闭。正本网关受控重启加载 H，既有登录桥保持健康；唯一一条
+  “任务完成了”带 flash 通知 job 1 最终 `done`（设备完成回执），随后设备仍在线。
+  用户确认第一条已听到声音；随后按授权仅补发一条“屏幕提示测试”带 flash，
+  job 2 最终 `done`；用户随后确认看到了提示、闪烁后回到 Ready。
+  按授权仅发送一条较长 OK 停播测试（flash=false），job 3 最终 `failed`、
+  `ok=false`，返回体无错误详情；设备仍在线、tts_active=false。用户随后确认
+  播放中短按 OK“立即停止了，回到 Ready”，该用户可感知停播行为实机 PASS；
+  job 未返回 cancelled：只读检查发现云取消先完成时，通知服务把
+  `speak_text` 的 `ok=false/error=cancelled` 映射为 failed，且 job 未保存 error；
+  属取消结果竞争缺陷。现存日志未记录回执/两个完成事件，无法证明现场精确先后。
+  已仅修复 gateway：保留当前 job 的明确 cancelled 结果，其他真实失败仍为 failed；
+  新增两种取消顺序、错误 ID 与迟到回执隔离回归。focused 128 passed；全量
+  **876 passed / 4 skipped，30.31 秒，exit=0**。固件未改，未重跑固件构建。
+  已受控重启网关加载修复（新实例 2026-10-20 11:12:35 启动，约4秒设备与云
+  自动就绪）；通知入口仍仅回环监听，只读鉴权检查无凭据401、有凭据查询不存在job404。
+  helper保持健康，未发通知。**修复已加载，cancelled设备复验未做**；历史job3失败不回写。
+  job 4 为随后单条通知，3.569 秒完成；用户确认原回复说完后才播放、未打断且有间隔，
+  体验通过。但提交采样 `tts_active=false`，忙时排队机制仍未实证。还需验准备阶段取消、并发 OK、
+  延迟回复、取消尾帧、断线恢复与闪烁配网。取消时尚无云响应 ID 会关闭云会话，
+  需验既有恢复提示与重新开始对话。保留 G4 改动，无重编、commit、push 或
+  依赖安装；凭据仅由进程加载既有 dotenv，未显示或修改。
+
+## 桌面工具恢复补验（2026-10-20）
+
+- 根因：helper 在网关退出后保留旧 activeCall，新会话注册持续 `409 call_conflict`；
+  另有失效 sandbox 连接永久缓存，使断流后注册持续 502。音频在线不能证明桌面工具就绪。
+- 已修复最后事件流关闭释放归属、迟到清理隔离、30 秒未开流注册过期，以及失败连接
+  按实例失效；仍在线冲突保持 409，业务错误/用户取消不清缓存，不自动重放 POST。
+- 主机测试：两处 RED 已实际失败；修复后 Node helper **14 passed**，Python focused
+  **74 passed**，最终 gateway 全量 **876 passed / 4 skipped，29.57 秒，exit=0**。
+- 运行：helper 已从旧参考目录受控切换到正本；既有网关无需重启自动恢复 native ready。
+  最终 helper 的 health/events 均 200；观察到一次断流后约 7 秒重新 presence 200/ready。
+- 真实探针：一次语音会话文字注入确实触发 search_conversations，但当时下层 502，返回
+  native_not_ready，不能判通过。随后无发声原生只读调用按实际 schema 使用
+  if_missing=say-no-record，返回 kind=served、output 有 hits/more、无 error；不展示内容。
+  前两次参数校验拒绝 invalid_input，未执行查询。未调用 send_task。
+- **验证边界**：已证明原生只读搜索接口可用；电脑信息任务的实际执行/权限及设备原问句
+  语音验收待用户补验。固件未改、未刷机，G4/H 改动保留，无依赖安装、commit 或 push。
+
+## 桌面工具恢复补验（2026-10-20）
+
+- 根因：helper 在网关退出后保留旧 activeCall，新会话注册持续 `409 call_conflict`；
+  另有失效 sandbox 连接永久缓存，使断流后注册持续 502。音频在线不能证明桌面工具就绪。
+- 已修复最后事件流关闭释放归属、迟到清理隔离、30 秒未开流注册过期，以及失败连接
+  按实例失效；仍在线冲突保持 409，业务错误/用户取消不清缓存，不自动重放 POST。
+- 主机测试：两处 RED 已实际失败；修复后 Node helper **14 passed**，Python focused
+  **74 passed**，最终 gateway 全量 **876 passed / 4 skipped，29.57 秒，exit=0**。
+- 运行：helper 已从旧参考目录受控切换到正本；既有网关无需重启自动恢复 native ready。
+  最终 helper 的 health/events 均 200；观察到一次断流后约 7 秒重新 presence 200/ready。
+- 真实探针：一次语音会话文字注入确实触发 search_conversations，但当时下层 502，返回
+  native_not_ready，不能判通过。随后无发声原生只读调用按实际 schema 使用
+  if_missing=say-no-record，返回 kind=served、output 有 hits/more、无 error；不展示内容。
+  前两次参数校验拒绝 invalid_input，未执行查询。未调用 send_task。
+- **验证边界**：已证明原生只读搜索接口可用；电脑信息任务的实际执行/权限及设备原问句
+  语音验收待用户补验。固件未改、未刷机，G4/H 改动保留，无依赖安装、commit 或 push。
+
+## 桌面助手“还是不可以”第二轮修复（2026-10-20）
+
+- 最新实机 11:27:03.213 工具为 send_task，outcome=new_user_required，user_epoch=0。
+  根因：manual_turn_mode 设备跳过 VAD，send_audio_stream_end 提交 commit 后未递增
+  user_epoch，导致安全门禁始终拒绝。
+- 修复：commit 成功后 +1，interrupt 同步清 manual_open/bytes，避免取消后意外授权。
+  新增 5 条回归：有效提交授权一次、同轮重复拒绝、短/空/取消/发送失败不授权、
+  内部 inject 不授权、auto VAD 照旧。GREEN 后全量 **881 passed / 4 skipped，30.81 秒**。
+- 本机真实探针：临时 helper、生产 GbotVoiceBridge、合成只读 OS 请求音频、无 ESP32
+  连接、无设备声音。commit 后 user_epoch=1，send_task dispatch relay=accepted，
+  tool_outcomes send_task:native_accepted=1。已证明生产 manual 音频提交路径可授权并
+  执行 send_task；不证明电脑信息实际读取内容或设备语音体验。
+- 受控重启：gateway 15275 → 23267 / supervisor 23251，原 env/stdin 保留，helper 20097 未动。
+  最终端口：gateway 23267 @ *:8765 / *:8766 / 127.0.0.1:8767；helper 20097 @ 127.0.0.1:18771。
+  device.connected=true，native health/events 200。
+- **用户最终验收（PASS）**：按住 OK 说“查看一下我电脑的信息”，用户明确确认
+  “现在好像可以了，已经能正常查看我电脑了”。三根因（409 旧会话归属、502 失效
+  sandbox 缓存、manual 录音未授权 send_task）经物理语音原问句实机验证通过。
+  此为用户确认，独立于本机探针；不再发声或重启。
 
 ## 3. 环境要求
 
@@ -50,17 +138,17 @@ cd firmware
 CC="$PWD/../tools/apple-cc" ./tools/validate.sh
 ```
 
-- 产物：`build/firmware/<full-bin-sha256>/full.bin`（含 ELF/MAP/分区表等），
+- 归档：`build/firmware/<full-bin-sha256>/`，包含
+  `FoloToy-AI-Passport-full.bin`、组件镜像、匹配的 ELF/MAP 和分区表。
   交付前用 `python3 tools/archive_firmware.py verify <归档目录>` 校验。
-- 刷机（示例，端口按实际填写）：
-
-  ```sh
-  esptool --chip esp32c3 -p /dev/cu.usbmodemXXXX -b 460800 \
-      write_flash 0x0 build/firmware/<sha>/full.bin
-  ```
-
-- ⚠ 从 `0x0` 合并刷写可能清除设备已存数据（包括已保存的配网）；刷机前
-  确认端口与固件 SHA256。
+- 日常更新默认保留 NVS，避免用户重新连接热点：先确认当前设备与待刷固件的
+  分区布局和配置格式兼容，再使用归档里的组件镜像按实际偏移刷写。当前 factory
+  应用偏移为 `0x10000`；不得把应用镜像写到 `0x0`。不使用会重新构建的命令替换
+  已批准的固件，也不默认写入 NVS/PHY 区域。
+- 首次完整安装或明确同意清除配置时，才使用从 `0x0` 写入的合并镜像
+  `FoloToy-AI-Passport-full.bin`。它可能清除 Wi-Fi、网关地址、令牌和音量等设置。
+- 每次刷机前确认端口、固件 SHA256、实际写入范围和用户授权；分区兼容性无法
+  证明时先停止并说明原因，不自动擦除 Flash。
 
 ## 5. 电脑端网关启动（Grok 语音）
 
@@ -94,6 +182,10 @@ STACKCHAN_USB_DISABLE=1 STACKCHAN_WAKE_WORD=0 uv run --all-extras stackchan-mcp
 
 - 检查：浏览器打开 `http://127.0.0.1:8766/debug/status`；设备连上后
   `device.connected=true`。
+- 主动播报（阶段 H）：在 `.env` 设 `STACKCHAN_NOTIFY_TOKEN`（留空则复用
+  `STACKCHAN_TOKEN`；两者都空则入口不启动）。网关启动后用
+  `gateway/tools/notify "任务完成了" --flash` 让设备在空闲时开口；入口仅
+  绑定 `127.0.0.1:8767`，对话中排队（60 秒过期），设备离线返回明确错误。
 - 注意：网关绑定 `0.0.0.0:8765`；若本机 8765 已被其它服务占用，先处理再启动。
 - Grok 语音桥走 Grok Bot 应用内部接口，App 大版本更新可能影响可用性；
   网关日志会给出具体错误。
@@ -156,6 +248,9 @@ STACKCHAN_USB_DISABLE=1 STACKCHAN_WAKE_WORD=0 uv run --all-extras stackchan-mcp
 - 状态页英文；无中文显示。
 - 语音最短时长阈值为本地 200 ms 产品决策，非协议要求。
 - Grok 语音依赖 Grok Bot 桌面应用登录与内部接口。
+- 主动播报（阶段 H）由 Grok 语音会话复述，不保证逐字；语音会话不可用时
+  播报失败（明确报错，不静默）。注入后若立刻按键说话，播报按现有半双工
+  语义优先播放。
 
 ## 10. 安全约定
 

@@ -416,6 +416,22 @@ bool pv_server_audio_valid(const pv_server_hello_t *hello)
            hello->audio.frame_duration == PV_DOWN_FRAME_DURATION_MS;
 }
 
+/* Reads a JSON true/false literal; no other literals are accepted. */
+static bool read_bool(const char *message, size_t len, size_t *i, bool *out)
+{
+    if (len - *i >= 4 && !strncmp(message + *i, "true", 4)) {
+        *i += 4;
+        *out = true;
+        return true;
+    }
+    if (len - *i >= 5 && !strncmp(message + *i, "false", 5)) {
+        *i += 5;
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 pv_tts_result_t pv_parse_tts_state(const char *message, size_t len,
                                    pv_tts_state_t *out)
 {
@@ -463,6 +479,95 @@ pv_tts_result_t pv_parse_tts_state(const char *message, size_t len,
     else if (!strcmp(state, "sentence_start")) *out = PV_TTS_SENTENCE_START;
     else return PV_TTS_MALFORMED;
     return PV_TTS_OK;
+}
+
+pv_notify_result_t pv_parse_notify(const char *message, size_t len,
+                                   pv_notify_state_t *state, bool *flash)
+{
+    if (!message || !state || !flash || len == 0 || len > PV_WS_MAX_MESSAGE)
+        return PV_NOTIFY_MALFORMED;
+    size_t i = 0;
+    while (i < len && is_space(message[i])) ++i;
+    if (i >= len || message[i++] != '{') return PV_NOTIFY_MALFORMED;
+    char type[16] = {0}, value[24] = {0};
+    bool type_seen = false, state_seen = false, flash_seen = false,
+         flash_value = false, closed = false;
+    while (i < len) {
+        while (i < len && is_space(message[i])) ++i;
+        if (i >= len) break;
+        if (message[i] == '}') { ++i; closed = true; break; }
+        if (message[i] != '"') return PV_NOTIFY_MALFORMED;
+        char key[32];
+        if (!read_string(message, len, &i, key, sizeof(key)))
+            return PV_NOTIFY_MALFORMED;
+        while (i < len && is_space(message[i])) ++i;
+        if (i >= len || message[i++] != ':') return PV_NOTIFY_MALFORMED;
+        while (i < len && is_space(message[i])) ++i;
+        if (i >= len) return PV_NOTIFY_MALFORMED;
+        if (!strcmp(key, "type")) {
+            if (type_seen || !read_string(message, len, &i, type, sizeof(type)))
+                return PV_NOTIFY_MALFORMED;
+            type_seen = true;
+        } else if (!strcmp(key, "state")) {
+            if (state_seen || !read_string(message, len, &i, value, sizeof(value)))
+                return PV_NOTIFY_MALFORMED;
+            state_seen = true;
+        } else if (!strcmp(key, "flash")) {
+            if (flash_seen || !read_bool(message, len, &i, &flash_value))
+                return PV_NOTIFY_MALFORMED;
+            flash_seen = true;
+        } else if (!skip_value(message, len, &i, 0)) {
+            return PV_NOTIFY_MALFORMED;
+        }
+        while (i < len && is_space(message[i])) ++i;
+        if (i < len && message[i] == ',') {
+            ++i; while (i < len && is_space(message[i])) ++i;
+            if (i >= len || message[i] != '"') return PV_NOTIFY_MALFORMED;
+            continue;
+        }
+        if (i < len && message[i] == '}') { ++i; closed = true; break; }
+        return PV_NOTIFY_MALFORMED;
+    }
+    if (!closed || !state_seen) return PV_NOTIFY_MALFORMED;
+    while (i < len && (is_space(message[i]) || message[i] == '\0')) ++i;
+    if (i != len) return PV_NOTIFY_MALFORMED;
+    if (!type_seen || strcmp(type, "notify")) return PV_NOTIFY_UNSUPPORTED;
+    if (!strcmp(value, "start")) *state = PV_NOTIFY_START;
+    else if (!strcmp(value, "stop")) *state = PV_NOTIFY_STOP;
+    else if (!strcmp(value, "cancel")) *state = PV_NOTIFY_CANCEL;
+    else return PV_NOTIFY_MALFORMED;
+    *flash = flash_seen && flash_value;
+    return PV_NOTIFY_OK;
+}
+
+unsigned pv_ws_request_id(const char *s, size_t len)
+{
+    if (!s || len > PV_WS_MAX_MESSAGE) return 0;
+    size_t i = 0; unsigned id = 0; bool seen = false;
+    while (i < len && is_space(s[i])) ++i;
+    if (i >= len || s[i++] != '{') return 0;
+    while (i < len) {
+        while (i < len && is_space(s[i])) ++i;
+        char key[32];
+        if (!read_string(s, len, &i, key, sizeof(key))) return 0;
+        while (i < len && is_space(s[i])) ++i;
+        if (i >= len || s[i++] != ':') return 0;
+        while (i < len && is_space(s[i])) ++i;
+        if (!strcmp(key, "id")) {
+            if (seen || i >= len || s[i] < '1' || s[i] > '9') return 0;
+            seen = true;
+            while (i < len && s[i] >= '0' && s[i] <= '9') {
+                if (id > 100000000) return 0;
+                id = id * 10 + (unsigned)(s[i++] - '0');
+            }
+        } else if (!skip_value(s, len, &i, 0)) return 0;
+        while (i < len && is_space(s[i])) ++i;
+        if (i < len && s[i] == ',') { ++i; continue; }
+        if (i >= len || s[i++] != '}') return 0;
+        while (i < len && is_space(s[i])) ++i;
+        return i == len ? id : 0;
+    }
+    return 0;
 }
 
 static bool peek_top_level_type(const char *s, size_t len, char *out, size_t capacity)
@@ -515,6 +620,14 @@ pv_text_kind_t pv_ws_classify_text(const char *message, size_t len,
             return PV_TEXT_IGNORE;
         if (state == PV_TTS_START) return PV_TEXT_TTS_START;
         if (state == PV_TTS_STOP) return PV_TEXT_TTS_STOP;
+    }
+    if (!strcmp(type, "notify")) {
+        pv_notify_state_t state;
+        bool flash = false;
+        if (pv_parse_notify(message, len, &state, &flash) != PV_NOTIFY_OK)
+            return PV_TEXT_IGNORE;
+        if (state == PV_NOTIFY_START) return PV_TEXT_NOTIFY_START;
+        if (state == PV_NOTIFY_STOP || state == PV_NOTIFY_CANCEL) return PV_TEXT_NOTIFY_STOP;
     }
     return PV_TEXT_IGNORE;
 }

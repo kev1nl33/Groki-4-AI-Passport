@@ -55,6 +55,10 @@ run_static_checks() {
         tests/test_passport_face.c main/passport_face.c \
         -o "${test_dir}/test_passport_face"
     "${test_dir}/test_passport_face"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_passport_diag.c main/passport_diag.c \
+        -o "${test_dir}/test_passport_diag"
+    "${test_dir}/test_passport_diag"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Icomponents/bsp/src \
         tests/test_bsp_display_rounding.c components/bsp/src/bsp_display_rounding.c \
         -o "${test_dir}/test_bsp_display_rounding"

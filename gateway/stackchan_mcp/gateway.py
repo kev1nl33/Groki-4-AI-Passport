@@ -27,6 +27,8 @@ from .gemini_voice_proxy import GeminiVoiceProxy
 from .gbot_voice_proxy import GbotVoiceProxy
 from .idle_behavior import IdleBehavior
 from .idle_gate import IdleGate
+from .notify_server import create_notify_app
+from .notify_service import NotifyService
 from .mac_control import resolve_claude_bin
 from .touch_bridge import TouchEventBridge
 from .tracking_bridge import TrackingBridge
@@ -227,20 +229,8 @@ class Gateway:
         notifier (e.g. a Claude Code Stop hook) can make the robot talk in its
         own voice instead of the separate Qwen3/VOICEVOX TTS used by ``say``.
         """
-        text = str(arguments.get("text") or "").strip()
-        if not text:
-            return {"ok": False, "error": "text is required"}
-        connection = getattr(self.esp32, "connection", None)
-        proxy = getattr(connection, "cloud_proxy", None)
-        speak = getattr(proxy, "speak_text", None)
-        if speak is None:
-            return {"ok": False, "error": "no active gemini voice session"}
-        return await speak(
-            text,
-            session_id=str(arguments.get("session_id") or "hook-notify"),
-            prompt_audio_frames=[],
-            emotion=str(arguments.get("emotion")) if arguments.get("emotion") else None,
-        )
+        # LAN WebSocket tool callers must not bypass the authenticated local API.
+        return {"ok": False, "error": "use_authenticated_loopback_notify"}
 
     @property
     def voice_backend(self) -> str:
@@ -326,6 +316,20 @@ class Gateway:
         )
 
     @property
+    def notify_token(self) -> str:
+        """Bearer token for the loopback notify endpoint (Stage H).
+
+        STACKCHAN_NOTIFY_TOKEN wins; otherwise the WS token is reused so
+        the endpoint is protected whenever the gateway itself is.
+        """
+        return (
+            os.getenv("STACKCHAN_NOTIFY_TOKEN")
+            or os.getenv("STACKCHAN_TOKEN")
+            or os.getenv("BEARER_TOKEN")
+            or ""
+        )
+
+    @property
     def voice_proxy_url(self) -> str:
         """xiaozhi cloud WebSocket URL used by the voice proxy."""
         return os.getenv("XIAOZHI_CLOUD_URL", DEFAULT_CLOUD_URL)
@@ -381,6 +385,43 @@ class Gateway:
         await self._http_runner.setup()
         site = web.TCPSite(self._http_runner, host, capture_port)
         await site.start()
+
+        # Stage H: loopback-only proactive notify endpoint. Never bound to
+        # the LAN-facing host; a token is mandatory or it stays disabled.
+        # The endpoint is optional: any setup failure disables it with a
+        # warning instead of taking the whole gateway down.
+        self.notify_service = None
+        self._notify_runner = None
+        self._notify_task = None
+        notify_token = self.notify_token
+        if notify_token:
+            try:
+                self.notify_service = NotifyService(self, status=get_debug_status())
+                notify_app = create_notify_app(
+                    service=self.notify_service, token=notify_token
+                )
+                self._notify_runner = web.AppRunner(notify_app)
+                await self._notify_runner.setup()
+                notify_port = int(os.getenv("STACKCHAN_NOTIFY_PORT", "8767"))
+                notify_site = web.TCPSite(self._notify_runner, "127.0.0.1", notify_port)
+                await notify_site.start()
+                self._notify_task = asyncio.create_task(self.notify_service.run())
+                logger.info(
+                    "Notify endpoint listening on 127.0.0.1:%d", notify_port
+                )
+            except Exception as exc:  # noqa: BLE001 — optional component
+                logger.warning("Notify endpoint disabled: %s", exc)
+                if self._notify_task is not None:
+                    self._notify_task.cancel()
+                if self._notify_runner is not None:
+                    await self._notify_runner.cleanup()
+                self.notify_service = None
+                self._notify_runner = None
+        else:
+            logger.warning(
+                "STACKCHAN_NOTIFY_TOKEN (or STACKCHAN_TOKEN) not set; "
+                "the loopback notify endpoint is disabled."
+            )
 
         self._running = True
         logger.info(
@@ -545,6 +586,18 @@ class Gateway:
         if self._http_runner:
             await self._http_runner.cleanup()
             self._http_runner = None
+        notify_task = getattr(self, "_notify_task", None)
+        if notify_task is not None:
+            notify_task.cancel()
+            try:
+                await notify_task
+            except asyncio.CancelledError:
+                pass
+            self._notify_task = None
+        notify_runner = getattr(self, "_notify_runner", None)
+        if notify_runner is not None:
+            await notify_runner.cleanup()
+            self._notify_runner = None
         await self.idle_gate.stop()
         await self.idle_behavior.stop()
         await self.tracking_bridge.stop()

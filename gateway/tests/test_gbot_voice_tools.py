@@ -154,6 +154,54 @@ async def test_function_result_waits_for_active_response_before_create(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_manual_committed_audio_grants_one_desktop_task(monkeypatch):
+    b = make(monkeypatch)
+    b.set_manual_turn_mode(True)
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+    try:
+        await b.begin_manual_turn()
+        await b.send_audio(bytes(6400))
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        assert b._user_epoch == 0
+        assert await b.send_audio_stream_end() is True
+        assert b._user_epoch == 1
+        await b.send_audio_stream_end()
+        assert b._user_epoch == 1
+        event = {"name": "send_task", "call_id": "manual-first", "arguments": '{"request":"Read only the OS family"}'}
+        await b._tool(event)
+        b._local.assert_awaited_once()
+        await b._tool({**event, "call_id": "same-turn-again"})
+        assert b._local.await_count == 1
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size,cancel,send_fails", [(0, False, False), (6398, False, False), (6400, True, False), (6400, False, True)])
+async def test_uncommitted_manual_audio_does_not_authorize_desktop(monkeypatch, size, cancel, send_fails):
+    b = make(monkeypatch)
+    b.set_manual_turn_mode(True)
+    b._local = AsyncMock()
+    try:
+        await b.begin_manual_turn()
+        await b.send_audio(bytes(size))
+        if cancel:
+            await b.interrupt()
+        if send_fails:
+            b._send.side_effect = RuntimeError("fixture transport failure")
+            with pytest.raises(RuntimeError):
+                await b.send_audio_stream_end()
+            b._send.side_effect = None
+        else:
+            await b.send_audio_stream_end()
+        assert b._user_epoch == 0
+        await b._tool({"name": "send_task", "call_id": "no-commit", "arguments": '{"request":"fixture"}'})
+        b._local.assert_not_awaited()
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
 async def test_internal_speech_does_not_grant_desktop_permission(monkeypatch):
     b = make(monkeypatch)
     b._local = AsyncMock()

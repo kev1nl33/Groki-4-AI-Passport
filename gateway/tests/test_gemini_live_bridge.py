@@ -187,10 +187,14 @@ def fake_google_genai(monkeypatch):
 
     class _Type:
         def __init__(self, **kwargs) -> None:
+            self.description = None
+            self.properties = None
             self.__dict__.update(kwargs)
 
     types_mod = ModuleType("google.genai.types")
     for name in (
+        "ActivityStart",
+        "ActivityEnd",
         "AudioTranscriptionConfig",
         "AutomaticActivityDetection",
         "Blob",

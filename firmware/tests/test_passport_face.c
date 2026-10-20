@@ -7,6 +7,7 @@ static void test_status_mapping(void)
     assert(pv_face_state_for_status("Listening...") == PV_FACE_LISTENING);
     assert(pv_face_state_for_status("Thinking...") == PV_FACE_THINKING);
     assert(pv_face_state_for_status("Speaking...") == PV_FACE_SPEAKING);
+    assert(pv_face_state_for_status("Notice...") == PV_FACE_SPEAKING); /* Stage H */
     assert(pv_face_state_for_status("Retrying...") == PV_FACE_SEARCHING);
     assert(pv_face_state_for_status("Audio error") == PV_FACE_ERROR);
     assert(pv_face_state_for_status("Send failed") == PV_FACE_ERROR);

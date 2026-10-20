@@ -22,6 +22,15 @@ Grok voice → localhost:18771 login helper → native Grok Bot
 Gemini ask_grokbot → optional localhost:18770 → gbot CLI → Grok Bot
 ```
 
+## 桌面通道恢复
+
+语音音频与桌面工具分别判断就绪。`/health` 正常只说明 helper 存活；
+`/native/health` 才检查桌面底层握手。最后一条事件流关闭即释放该会话归属，
+注册后未开流的会话在 30 秒后过期；仍在线的并发会话继续返回 `409 call_conflict`。
+传输或认证失败会使对应缓存连接失效，由既有重试重新定位；不会自动重放请求。
+上述生命周期已加入 Node 回归测试。2026-10-20 真实原生只读搜索返回 `served`；
+“查看电脑信息”原问句的设备语音验收仍待用户完成。
+
 ## 需不需要装网关
 
 Groki Bot 固件自己就能对话：刷好固件，在设置页填上自己的 OpenAI 或 Gemini 密钥，不接电脑也能说话。以下情况再装网关：
