@@ -1,6 +1,6 @@
 [简体中文](README.zh-CN.md) | **English**
 
-# AI Passport Voice
+# Groki-4-AI-Passport
 
 A voice-conversation application for the
 [FoloToy AI Passport](https://github.com/FoloToy/ai-passport) (ESP32-C3,
